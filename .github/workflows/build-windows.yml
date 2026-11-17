@@ -1,0 +1,117 @@
+name: Build Windows EXE
+
+# 只要把代码推到 main / master，就自动构建并自动发布 Release。
+# 也可以在 Actions 页面点 "Run workflow" 手动触发。
+on:
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: 'Publish a Release (gives a download link)'
+        type: boolean
+        default: true
+      embed_chromium:
+        description: 'Embed Chromium (+150MB; only for PCs without Edge/Chrome)'
+        type: boolean
+        default: false
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements_gui.txt
+
+      # app.ico 是二进制文件，仓库里以 app.ico.b64 文本保存，构建时还原
+      - name: Decode app icon
+        shell: pwsh
+        run: |
+          $b64 = (Get-Content 'app.ico.b64' -Raw).Trim()
+          $dst = Join-Path $PWD.Path 'app.ico'
+          [IO.File]::WriteAllBytes($dst, [Convert]::FromBase64String($b64))
+          if ((Get-Item $dst).Length -lt 1000) { throw 'app.ico decode failed' }
+          Write-Host "app.ico restored: $((Get-Item $dst).Length) bytes"
+
+      - name: Check required files
+        shell: pwsh
+        run: |
+          $need = @(
+            'run_gui.py', 'updater.py', 'app.ico', 'version_info.txt', 'cloud_config.json',
+            'gui\__init__.py', 'gui\state.py', 'gui\adapter.py', 'gui\engine.py',
+            'gui\app.py', 'gui\theme.py', 'gui\license.py', 'gui\login_window.py',
+            'scripts\report_reviews.py'
+          )
+          $miss = @($need | Where-Object { -not (Test-Path $_) })
+          if ($miss.Count) { throw "Missing required files: $($miss -join ', ')" }
+          $cfg = Get-Content 'cloud_config.json' -Raw | ConvertFrom-Json
+          if (-not $cfg.endpoint) { throw 'cloud_config.json has no endpoint' }
+          Write-Host "Files OK; endpoint: $($cfg.endpoint)"
+
+      - name: Optional - download Chromium kernel
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.embed_chromium }}
+        shell: pwsh
+        run: |
+          $p = Join-Path $PWD.Path 'runtime\ms-playwright'
+          "PLAYWRIGHT_BROWSERS_PATH=$p" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python -m playwright install chromium
+
+      - name: Build single-file EXE
+        shell: pwsh
+        run: |
+          $extra = @()
+          if ("${{ inputs.embed_chromium }}" -eq "true") {
+            $extra += @('--add-data', 'runtime\ms-playwright;ms-playwright')
+          }
+          # 把授权服务器地址打进 exe，使用者无需手动配置
+          $extra += @('--add-data', 'cloud_config.json;.')
+          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+            --name PDD_Review_Helper `
+            --icon app.ico `
+            --version-file version_info.txt `
+            --distpath dist --workpath build --specpath . `
+            --collect-all playwright --collect-all pyee --collect-all greenlet `
+            --hidden-import=gui.license --hidden-import=gui.login_window --hidden-import=updater `
+            --add-data 'scripts;scripts' @extra run_gui.py
+
+      - name: Verify EXE exists
+        shell: pwsh
+        run: |
+          $exe = 'dist/PDD_Review_Helper.exe'
+          if (-not (Test-Path $exe)) { throw 'EXE was not produced' }
+          $f = Get-Item $exe
+          if ($f.Length -lt 10MB) { throw "EXE looks broken, only $($f.Length) bytes" }
+          $f | Select-Object FullName, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDD_Review_Helper
+          path: dist/PDD_Review_Helper.exe
+          if-no-files-found: error
+
+      - name: Publish Release (download link)
+        if: ${{ github.event_name == 'push' || inputs.make_release }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v1.0.0-$env:GITHUB_RUN_NUMBER-$(Get-Date -Format yyyyMMdd-HHmm)"
+          gh release create $tag dist/PDD_Review_Helper.exe `
+            --title "PDD Review Helper $tag" `
+            --notes "Windows single-file EXE built by GitHub Actions. Double click to run; Python not required."
+          Write-Host "Download: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases/tag/$tag"

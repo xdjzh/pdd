@@ -1,0 +1,28 @@
+# 本地运行数据（登录态、台账、日志）—— 绝不上传
+pdd_data/
+shops/
+*.log
+
+# 构建产物
+dist/
+build/
+*.spec
+runtime/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 密钥 / 本地私有产物 —— 绝不上传
+.keys.local.json
+*.pem
+*_PRIVATE_KEY*
+publish_update.json
+update_bundle.zip
+
+# 系统
+.DS_Store
+Thumbs.db
