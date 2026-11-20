@@ -851,21 +851,21 @@ class App(object):
         self._call("refresh")
 
     def do_star_diag(self):
-        """把真实页面结构自动回传，用户不必再手动找文件、发文件。"""
+        """生成桌面诊断报告：纯本地文本 + 页面截图，不依赖云回传。"""
         sid = self.selected()
-        if not sid:
-            return
-        self._call("star_diag", sid)
+        if sid:
+            self._call("star_diag", sid)
         messagebox.showinfo(
-            "页面诊断",
-            "正在后台采集当前评价页信息并自动回传（约 6 秒）。\n\n"
-            "回传成功后开发者就能按你后台的真实页面精确适配，\n"
-            "不需要你手动找文件、发文件。\n\n"
-            "本地也会留一份「星级诊断_*.json」，长数字已打码，\n"
-            "不含密码或密钥。",
+            "页面诊断（桌面文件）",
+            "正在生成诊断报告（约 6 秒）。\n\n"
+            "完成后会在桌面出现两个文件：\n"
+            "  PDD诊断_<店铺名>_<时间>.txt  （页面结构、导航、接口）\n"
+            "  PDD诊断_<店铺名>_<时间>_页面截图.png\n\n"
+            "请把这两个文件直接发给开发者，不需要改动内容。\n"
+            "诊断完全在本机生成，即使软件显示『离线』也能用。",
             parent=self.root)
         self.root.after(6000,
-                        lambda p=self.store.shop_dir(sid): self._open(p))
+                        lambda p=self.store.shop_dir(sid or ""): self._open(p))
 
     def _license_ok(self):
         """开始举报前复核授权：吊销 / 到期会即时挡住。"""

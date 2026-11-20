@@ -264,11 +264,21 @@ class Engine(object):
                     await s.run_exclusive(s.refresh_stars(), kind="refresh")
                 s._last_star_check = time.time()
                 s._last_heartbeat = time.time()
+                # 每次刷新都无条件写一份桌面诊断（纯本地，不依赖云回传），
+                # 这样即使读数成功也能核对，读不到时用户可直接把文件发来。
+                try:
+                    await s.write_desktop_diag(tag="刷新数量")
+                except Exception:
+                    pass
             elif cmd == "shop_name":
                 await s.run_exclusive(s.refresh_shop_name(overwrite=True),
                                       kind="refresh")
             elif cmd == "star_diag":
                 await s.run_exclusive(s.export_star_diag(), kind="refresh")
+                try:
+                    await s.write_desktop_diag(tag="手动诊断")
+                except Exception:
+                    pass
             elif cmd == "start_report":
                 await s.run_exclusive(s.run_report(), kind="report")
             else:

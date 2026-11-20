@@ -1337,6 +1337,116 @@ class ShopSession(object):
             "apiUrls": self.api_urls[-30:], "apiHints": self.api_hints[-10:],
         }
 
+    async def _desktop_paths(self, tag):
+        """诊断文件固定放桌面，用户一眼就能找到并发出来。"""
+        folder = ""
+        try:
+            folder = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        except Exception:
+            folder = os.path.expanduser("~")
+        safe = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5_-]", "_", self.name)[:20] or "shop"
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base = "PDD诊断_%s_%s_%s" % (safe, tag, stamp)
+        return (os.path.join(folder, base + ".txt"),
+                os.path.join(folder, base + "_页面截图.png"))
+
+    async def write_desktop_diag(self, tag="刷新数量", reason=""):
+        """把浏览器现场写成桌面文本 + 截图。全程本地，不需要网络、不需要云回传。"""
+        txt_path, png_path = await self._desktop_paths(tag)
+        try:
+            import updater
+            ver = updater.version_info()
+        except Exception:
+            ver = {}
+        payload = await self._build_diag_payload(reason)
+        page = payload.get("page") or {}
+        snap = payload.get("snapshot") or {}
+        card = payload.get("cardProbe") or {}
+        lines = []
+        A = lines.append
+        A("=" * 72)
+        A("PDD 工作台 · 星级诊断报告")
+        A("时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        A("版本：%s  内核：%s" % (ver.get("label", "?"), ver.get("version", "?")))
+        A("店铺：%s" % self.name)
+        A("场景：%s" % tag)
+        A("说明：请直接把本文件 + 同名截图发给开发者，不要改动内容。")
+        A("=" * 72)
+        A("")
+        A("【1. 当前读数】")
+        A("星级 1/2/3：%s" % payload.get("currentStars"))
+        A("是否可信 stars_ok：%s   来源：%s" %
+          (payload.get("starsOk"), payload.get("starsSource")))
+        A("失败原因 starNote：%s" % payload.get("starNote"))
+        A("")
+        A("【2. 页面判定与导航】")
+        A("page_kind：%s" % payload.get("pageKind"))
+        A("page_url ：%s" % payload.get("pageUrl"))
+        A("导航日志 navLog：")
+        for x in (payload.get("navLog") or []):
+            A("   - %s" % x)
+        A("")
+        A("【3. 浏览器实际落地】")
+        A("URL   ：%s" % page.get("url"))
+        A("标题  ：%s" % page.get("title"))
+        A("正文前 2500 字：")
+        A(page.get("bodyHead") or "(空)")
+        A("")
+        A("【4. 星级相关控件 HTML（最关键）】")
+        star_els = page.get("starEls") or []
+        if not star_els:
+            A("   (没有识别到任何含『星/评分/等级』的控件)")
+        for i, el in enumerate(star_els[:30]):
+            A("   [%d] 文本=%s  tag=%s  class=%s" %
+              (i, el.get("t"), el.get("tag"), el.get("cls")))
+            A("        HTML：%s" % el.get("html"))
+        A("")
+        A("【5. 分页结构与按钮】")
+        for i, p in enumerate(page.get("pagers") or []):
+            A("   分页[%d]：%s" % (i, p))
+        for i, b in enumerate((page.get("buttons") or [])[:40]):
+            A("   按钮[%d] 文本=%s class=%s selected=%s checked=%s" %
+              (i, b.get("t"), b.get("cls"), b.get("sel"), b.get("chk")))
+        A("")
+        A("【6. 评价卡片探测】")
+        A("scan total=%s  counts=%s" % (card.get("total"), card.get("counts")))
+        for s in (card.get("samples") or []):
+            A("   样例 %s星：%s" % (s.get("star"), s.get("text")))
+        A("")
+        A("【7. 页面快照候选】")
+        A("分页 totalText=%s total=%s" % (snap.get("totalText"), snap.get("total")))
+        A("星级候选 tabRaw=%s" % (snap.get("tabRaw") or [])[:8])
+        A("含星文本 starTexts=%s" % (snap.get("starTexts") or [])[:20])
+        A("列表指纹 listSig=%s" % snap.get("listSig"))
+        A("")
+        A("【8. 页面发出的接口（找出评价 API）】")
+        for u in (page.get("resources") or [])[:40]:
+            A("   %s" % u)
+        A("   本会话接口摘要：")
+        for h in (payload.get("apiHints") or [])[:8]:
+            A("   - %s  starMap=%s totals=%s" %
+              (h.get("url"), h.get("starMap"), h.get("totals")))
+        A("")
+        A("【9. iframe / 全局数据】")
+        A("frames=%s" % (page.get("frames") or []))
+        for k, v in (page.get("globals") or {}).items():
+            A("   %s = %s" % (k, str(v)[:800]))
+        A("")
+        A("=" * 72)
+        A("截图文件：%s" % png_path)
+        A("（若截图不存在，说明当时浏览器窗口未就绪，文本信息仍然有效）")
+        A("=" * 72)
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        # 截图：隐藏浏览器也能截，失败不影响文本
+        try:
+            if self.page:
+                await self.page.screenshot(path=png_path, full_page=False, timeout=15000)
+        except Exception as e:
+            png_path = "(截图失败：%s)" % str(e)[:80]
+        self.set(message="桌面诊断已生成：%s" % os.path.basename(txt_path))
+        return txt_path, png_path
+
     async def _save_diag_local(self, reason=""):
         """诊断同时落到店铺目录：离线或回传失败时也能把文件发出来排查。"""
         payload = await self._build_diag_payload(reason)
