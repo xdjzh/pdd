@@ -274,10 +274,13 @@ PAGE_KIND_JS = r"""
   const reviewUrl = /evaluat|comment|review/i.test(u) && !goodsList;
   const starTextCount = (body.match(/给出了\s*[1-5]\s*星|用户评价分/g) || []).length;
   const reportBtnCount = (body.match(/举报/g) || []).length;
+  // 商品列表页绝不会有「给出了 N 星」的评价卡片；若两类评价特征同时出现，
+  // 即使 SPA 没改 URL，也要认定已经进入评价页。
+  const reviewContent = starTextCount > 0 && reportBtnCount >= 3;
   return {
     url: u, title: t, goodsList: goodsList, reviewUrl: reviewUrl,
-    isReview: !goodsList && (reviewUrl || starTextCount > 0 ||
-              (/评价管理|评价举报/.test(body) && reportBtnCount >= 3)),
+    isReview: ((!goodsList && (reviewUrl || starTextCount > 0 ||
+              (/评价管理|评价举报/.test(body) && reportBtnCount >= 3))) || reviewContent),
     links: links, starTextCount: starTextCount,
     reportBtnCount: reportBtnCount, head: clean(body).slice(0, 300)
   };
@@ -1052,7 +1055,8 @@ class ShopSession(object):
                                                         timeout=10000)
                 except Exception:
                     pass
-                await asyncio.sleep(1.2)
+                # 拼多多是 SPA，落地后异步渲染，1.2s 常常还没切完页面
+                await asyncio.sleep(2.2)
             except Exception as e:
                 nav_log.append("%s→异常:%s" % (url.rsplit("/", 1)[-1][:36],
                                                str(e)[:36]))
@@ -1073,6 +1077,38 @@ class ShopSession(object):
                 except Exception:
                     pass
                 return True
+
+        # 侧栏真实入口兜底：新版后台的侧栏菜单多是 div + JS 路由，a[href]
+        # 抓不到，直接按可见文字点击「评价管理 / 评价举报」最可靠。
+        for label in ("评价管理", "评价举报"):
+            try:
+                loc = self.page.get_by_text(label, exact=True)
+                n = await loc.count()
+                for i in range(min(3, n)):
+                    item = loc.nth(i)
+                    if not await item.is_visible():
+                        continue
+                    await item.click(timeout=5000)
+                    await asyncio.sleep(2.2)
+                    k3 = await self._page_kind()
+                    cur3 = k3.get("url", "")
+                    nav_log.append("点击%s→%s" %
+                                   (label, cur3.rsplit("/", 1)[-1][:36]))
+                    if "login" in cur3.lower() or "passport" in cur3.lower():
+                        self.page_kind, self.page_url, self.nav_log = "login", cur3, nav_log
+                        self.online = False
+                        self.set("掉线，请重新扫码", "登录态已失效")
+                        return False
+                    if k3.get("isReview"):
+                        self.page_kind, self.page_url, self.nav_log = "review", cur3, nav_log
+                        try:
+                            await self._auto_name_if_needed()
+                        except Exception:
+                            pass
+                        return True
+                    break
+            except Exception as e:
+                nav_log.append("点击%s异常:%s" % (label, str(e)[:30]))
 
         final = await self._page_kind()
         self.page_url = final.get("url", "")
@@ -1186,7 +1222,7 @@ class ShopSession(object):
         label = {"api": "评价接口", "tab": "星级标签",
                  "cards": "逐页统计评价卡片", "pager": "筛选分页"}.get(source, source)
         self.set(message=("1/2/3 星数量已更新（来源：%s）" % label) if ok else
-                 "未读到可信的评价数量，正在自动回传页面诊断；可点「刷新数量」重试")
+                 "未读到可信的评价数量，诊断已本地留档并自动回传；可点「刷新数量」重试")
         self.engine.publish(self)
 
     async def count_stars_by_cards(self, max_pages=12, max_seconds=55):
@@ -1301,6 +1337,16 @@ class ShopSession(object):
             "apiUrls": self.api_urls[-30:], "apiHints": self.api_hints[-10:],
         }
 
+    async def _save_diag_local(self, reason=""):
+        """诊断同时落到店铺目录：离线或回传失败时也能把文件发出来排查。"""
+        payload = await self._build_diag_payload(reason)
+        safe = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5_-]", "_", self.name)[:24] or "shop"
+        fname = "星级诊断_%s_%s.json" % (safe, time.strftime("%Y%m%d_%H%M%S"))
+        path = os.path.join(self.store.shop_dir(self.id), fname)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return path
+
     async def upload_star_diag(self, reason="", force=False):
         """把诊断自动回传到云端，用户不用再手动找文件、传文件。"""
         if not force and time.time() - self._diag_uploaded_at < 1800:
@@ -1317,14 +1363,24 @@ class ShopSession(object):
                 {"shop": self.name, "reason": reason, "packed": packed,
                  "size": len(raw)}, timeout=20)
         except Exception as e:
-            self.set(message="诊断回传异常：%s" % str(e)[:100])
+            try:
+                path = await self._save_diag_local(reason or "诊断回传异常")
+                self.set(message="诊断回传异常（%s），已保存到本地：%s" %
+                                 (str(e)[:50], os.path.basename(path)))
+            except Exception:
+                self.set(message="诊断回传异常：%s" % str(e)[:100])
             return False
         self._diag_uploaded_at = time.time()
         if res.get("ok"):
             self.set(message="页面诊断已自动回传（编号 %s），无需手动发文件" %
                              str(res.get("diagId", ""))[:16])
         else:
-            self.set(message="诊断回传失败：%s" % str(res.get("msg", ""))[:90])
+            try:
+                path = await self._save_diag_local(reason or "诊断回传失败")
+                self.set(message="诊断回传失败（%s），已保存到本地：%s" %
+                                 (str(res.get("msg", ""))[:50], os.path.basename(path)))
+            except Exception:
+                self.set(message="诊断回传失败：%s" % str(res.get("msg", ""))[:90])
         return bool(res.get("ok"))
 
     async def refresh_stars(self):
@@ -1353,8 +1409,14 @@ class ShopSession(object):
             cn = {"goods_list": "商品列表页", "login": "登录页"}.get(
                 self.page_kind, "其它页面")
             tail = (getattr(self, "page_url", "") or "").rsplit("/", 1)[-1][:36]
-            note = "当前停在%s（%s），未能进入评价管理页，数量未读取" % (cn, tail)
+            nav = " / ".join((getattr(self, "nav_log", []) or [])[:5])
+            note = "当前停在%s（%s），未能进入评价管理页，数量未读取%s" % (
+                cn, tail, ("；导航：" + nav) if nav else "")
             self._apply_stars({}, "none", False, note)
+            try:
+                await self._save_diag_local(reason="页面守卫：" + note)
+            except Exception:
+                pass
             await self.upload_star_diag(reason="页面守卫：" + note, force=True)
             return
 

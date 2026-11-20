@@ -40,8 +40,11 @@ USER_DATA_DIR = str(Path(__file__).parent.parent / "assets" / "browser_data")
 # 2026-11 商家后台改版：旧 /goods/evaluate/list 会被重定向到 /goods/goods_list
 # （商品列表），程序会把「共有 7 条」的在售商品误读成评价数量。侧栏真实入口
 # 是 /goods/evaluation/index。保留多个候选，运行时按落地 URL 校验逐个尝试。
-REVIEW_MANAGE_URL = "https://mms.pinduoduo.com/goods/evaluation/index"
+REVIEW_MANAGE_URL = "https://mms.pinduoduo.com/goods/evaluation/index?msfrom=mms_sidenav"
 REVIEW_PAGE_URLS = [
+    # 侧栏「评价管理」真实链接带 msfrom=mms_sidenav，裸路径在部分店铺会被
+    # 重定向回商品列表，所以带参数的放第一位。
+    "https://mms.pinduoduo.com/goods/evaluation/index?msfrom=mms_sidenav",
     "https://mms.pinduoduo.com/goods/evaluation/index",
     "https://mms.pinduoduo.com/goods/evaluation/index?sellerRightProtect=1",
     "https://mms.pinduoduo.com/goods/evaluate/list",
