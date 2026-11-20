@@ -36,8 +36,16 @@ PDD_MMS_URL = "https://mms.pinduoduo.com/"
 # 浏览器用户数据目录（保存登录态，下次免登录）
 USER_DATA_DIR = str(Path(__file__).parent.parent / "assets" / "browser_data")
 
-# 评价管理页面路径（常见路径，如不匹配请替换）
-REVIEW_MANAGE_URL = "https://mms.pinduoduo.com/goods/evaluate/list"
+# 评价管理页面路径。
+# 2026-11 商家后台改版：旧 /goods/evaluate/list 会被重定向到 /goods/goods_list
+# （商品列表），程序会把「共有 7 条」的在售商品误读成评价数量。侧栏真实入口
+# 是 /goods/evaluation/index。保留多个候选，运行时按落地 URL 校验逐个尝试。
+REVIEW_MANAGE_URL = "https://mms.pinduoduo.com/goods/evaluation/index"
+REVIEW_PAGE_URLS = [
+    "https://mms.pinduoduo.com/goods/evaluation/index",
+    "https://mms.pinduoduo.com/goods/evaluation/index?sellerRightProtect=1",
+    "https://mms.pinduoduo.com/goods/evaluate/list",
+]
 
 # 筛选的星级：1星、2星、3星
 TARGET_STARS = [1, 2, 3]
@@ -282,7 +290,7 @@ SELECTORS = {
 
     # 评价管理导航
     "nav_evaluate": "text=评价管理",
-    "evaluate_link": "a[href*='evaluate'], a[href*='comment'], a[href*='review'], :text('评价管理')",
+    "evaluate_link": "a[href*='evaluation'], a[href*='evaluate'], a[href*='comment'], a[href*='review'], :text('评价管理')",
 
     # 星级筛选
     "star_filter_all": "text=全部",  # 先展开全部筛选
@@ -665,31 +673,55 @@ class PinduoduoReviewReporter:
         except Exception as e:
             print(f"   ⚠️ 文本扫描失败: {e}")
 
+    @staticmethod
+    def _is_review_page_url(url):
+        u = (url or "").lower()
+        return (("evaluat" in u or "comment" in u or "review" in u)
+                and "goods_list" not in u)
+
     async def navigate_to_review_management(self):
-        """导航到评价管理页面"""
+        """导航到评价管理页面，并确认真的落在评价页。
+
+        2026-11 改版后旧地址会被重定向到商品列表页（共有 7 条 = 7 个商品），
+        所以按候选地址逐个尝试 + 校验落地 URL；还不行就从侧栏读真实 href 再跳。
+        """
         print("\n📍 正在导航到评价管理页面...")
 
-        # 先尝试直接访问评价管理URL
-        await self.page.goto(REVIEW_MANAGE_URL, wait_until="domcontentloaded")
-        await asyncio.sleep(PAGE_WAIT_SECONDS + 1)
-
-        # 等待页面网络请求完成
+        candidates = list(REVIEW_PAGE_URLS)
         try:
-            await self.page.wait_for_load_state("networkidle", timeout=15000)
+            hrefs = await self.page.evaluate("""
+                () => Array.from(document.querySelectorAll(
+                    'a[href*="evaluat"], a[href*="comment"], a[href*="review"]'))
+                  .map(a => a.getAttribute('href')).filter(Boolean).slice(0, 10)
+            """)
+            for h in hrefs or []:
+                if h.startswith("//"):
+                    h = "https:" + h
+                elif h.startswith("/"):
+                    h = "https://mms.pinduoduo.com" + h
+                if h.startswith("http") and h not in candidates:
+                    candidates.append(h)
         except Exception:
             pass
 
-        # 滚动页面确保内容加载
-        await self.scroll_to_bottom()
-        await asyncio.sleep(1)
-        await self.page.evaluate("window.scrollTo(0, 0)")
-        await asyncio.sleep(0.5)
+        landed = False
+        for url in candidates[:8]:
+            try:
+                await self.page.goto(url, wait_until="domcontentloaded")
+            except Exception as e:
+                print(f"   ⚠️ 访问 {url} 失败: {str(e)[:80]}")
+                continue
+            await asyncio.sleep(PAGE_WAIT_SECONDS + 1)
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+            print(f"   📍 尝试 {url} → 实际 {self.page.url}")
+            if self._is_review_page_url(self.page.url):
+                landed = True
+                break
 
-        current_url = self.page.url
-        print(f"   📍 当前URL: {current_url}")
-
-        # 如果直接跳转失败（URL不含评价关键词），尝试通过导航菜单点击
-        if "evaluate" not in current_url and "comment" not in current_url and "review" not in current_url:
+        if not landed:
             print("   直接访问未进入评价页，尝试通过导航菜单...")
             for selector in SELECTORS["evaluate_link"].split(", "):
                 selector = selector.strip()
@@ -702,12 +734,14 @@ class PinduoduoReviewReporter:
                             await self.page.wait_for_load_state("networkidle", timeout=15000)
                         except Exception:
                             pass
-                        await self.scroll_to_bottom()
-                        await asyncio.sleep(1)
-                        print(f"   ✅ 通过 '{selector}' 进入评价管理, URL: {self.page.url}")
-                        break
+                        if self._is_review_page_url(self.page.url):
+                            landed = True
+                            print(f"   ✅ 通过 '{selector}' 进入评价管理, URL: {self.page.url}")
+                            break
                 except Exception:
                     continue
+            if not landed:
+                print(f"   ⚠️ 未能进入评价管理页，当前：{self.page.url}")
 
         # ===== 完整诊断：截图+文本+HTML =====
         print("\n   🔬 正在分析评价管理页面结构...")

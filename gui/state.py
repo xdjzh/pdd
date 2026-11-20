@@ -180,6 +180,9 @@ def blank_state(name=""):
         "star1": 0,
         "star2": 0,
         "star3": 0,
+        "stars_ok": False,       # 未确认时表格显示「—」，不展示假数字
+        "stars_source": "",      # api / tab / pager / none
+        "star_note": "",
         "reported": 0,          # 本次举报数量
         "last_check": "",
         "daily_limit": False,

@@ -10,6 +10,7 @@
 """
 import asyncio
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -112,59 +113,372 @@ SHOP_NAME_JS = r"""
 }
 """
 
-# 列表快照：总条数 / 页码 / 每页条数 / 订单指纹 / 选中星级 / 星级标签数量。
-# 用于判断「筛选切换后列表是否真的刷新」，避免读到上一次筛选的旧分页数据。
+# 列表快照：总条数 / 页码 / 每页条数 / 列表指纹 / 星级标签计数候选。
+# 注意：只取第一个分页组件、或用「订单编号」判断列表是否刷新，都会导致
+# 三个星级读到同一个旧数字（历史上表现为 7? / 7? / 7?）。
+# 现在把所有候选一并交给 Python 侧按可信度裁决，并额外提供诊断素材。
 STAR_SNAPSHOT_JS = r"""
 () => {
-  const ul = document.querySelector('ul[data-testid="beast-core-pagination"]');
-  let total = null, totalText = '', page = null, size = null;
-  if (ul) {
+  const clean = s => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const visible = el => { try { return !!el && el.offsetParent !== null; } catch (e) { return false; } };
+  const cls = el => String((el && el.className) || '').slice(0, 160);
+  const hash = s => {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(16);
+  };
+
+  // 1) 枚举所有分页组件：页面上可能不止一个列表
+  const pagers = [];
+  for (const ul of document.querySelectorAll(
+      'ul[data-testid="beast-core-pagination"], ul[data-testid*="pagination"]')) {
+    let totalText = '';
     const tEl = ul.querySelector('li[class*="PGT_totalText_"]');
-    totalText = tEl ? (tEl.innerText || '') : '';
-    const m = totalText.match(/([0-9]+)\s*条/);
-    if (m) total = parseInt(m[1], 10);
+    if (tEl) totalText = clean(tEl.innerText || tEl.textContent);
+    if (!totalText) {
+      for (const li of ul.querySelectorAll('li')) {
+        const t = clean(li.innerText || li.textContent);
+        if (/共有?\s*[0-9]+\s*条/.test(t)) { totalText = t; break; }
+      }
+    }
+    const tm = totalText.match(/([0-9]+)\s*条/);
     const st = ul.getAttribute('data-status') || '';
     const sm = st.match(/pagination-([0-9]+)-([0-9]+)/);
-    if (sm) { size = parseInt(sm[1], 10); page = parseInt(sm[2], 10); }
-    const act = ul.querySelector('li[class*="PGT_pagerItemActive_"]');
-    if (page === null && act) page = parseInt((act.textContent || '').trim(), 10);
+    pagers.push({
+      total: tm ? parseInt(tm[1], 10) : null,
+      totalText: totalText, status: st,
+      size: sm ? parseInt(sm[1], 10) : null,
+      page: sm ? parseInt(sm[2], 10) : null,
+      visible: visible(ul)
+    });
   }
+  const mainPager = pagers.find(p => p.visible && p.total !== null) ||
+                    pagers.find(p => p.total !== null) || pagers[0] || null;
+  let total = mainPager ? mainPager.total : null;
   if (total === null) {
     const m = (document.body.innerText || '').match(/共(?:有)?\s*([0-9]+)\s*条/);
     if (m) total = parseInt(m[1], 10);
   }
-  const tabCounts = {};
-  for (const el of document.querySelectorAll('span,div,a,button,li,label,p,td,th')) {
-    if (el.offsetParent === null || el.children.length > 2) continue;
-    const t = (el.innerText || el.textContent || '').trim();
-    if (!t || t.length > 24) continue;
-    const m = t.match(/^([1-5])\s*星[^0-9]{0,6}([0-9]+)/);
+
+  // 2) 星级数字候选：全部收集，Python 侧按「是否在筛选区 / 是否冲突」裁决
+  const tabRaw = [], starTexts = [], countTexts = [];
+  for (const el of document.querySelectorAll(
+      'span,div,a,button,li,label,p,td,th,option,em,b,strong')) {
+    if (!visible(el) || el.children.length > 3) continue;
+    const t = clean(el.innerText || el.textContent || '');
+    if (!t || t.length > 30) continue;
+    if (/给出了|好评|差评|评价内容|追评|回复|买家/.test(t)) continue;
+    const c = cls(el) + ' ' + (el.parentElement ? cls(el.parentElement) : '');
+    if (/星/.test(t) && starTexts.length < 60) starTexts.push(t);
+    if (/[0-9]+\s*条|共|合计/.test(t) && countTexts.length < 40) countTexts.push(t);
+    const m = t.match(/^([1-5]|[一二三四五])\s*[星★分][^0-9]{0,12}([0-9]+)/);
     if (!m) continue;
+    const cn = {'一':1,'二':2,'三':3,'四':4,'五':5};
+    const sv = cn[m[1]] ? cn[m[1]] : parseInt(m[1], 10);
+    if (!sv || sv < 1 || sv > 5) continue;
     const n = parseInt(m[2], 10);
-    if (n >= 0 && n < 100000) tabCounts[m[1]] = n;
+    if (!Number.isFinite(n) || n < 0 || n > 999999) continue;
+    tabRaw.push({
+      star: sv, n: n, text: t.slice(0, 40), tag: el.tagName,
+      cls: c.slice(0, 160),
+      filterish: /tab|filter|star|level|radio|segment|nav|score|count|num|option/i.test(c) ? 1 : 0
+    });
   }
+
+  // 3) 列表指纹：不依赖「订单编号」字样（页面常写「订单号」或干脆不显示）
   const body = document.body.innerText || '';
-  const ids = body.match(/订单编号[:：]?\s*([0-9A-Za-z-]{8,})/g) || [];
+  const host = document.querySelector(
+      '[class*="table"], [class*="Table"], [class*="list"], [class*="List"], tbody') || document.body;
+  const listText = clean((host.innerText || body).slice(0, 1500));
+  const ids = body.match(/(?:订单编号|订单号|订单SN)[:：]?\s*([0-9A-Za-z-]{8,})/g) || [];
   const activeStars = [];
   for (const el of document.querySelectorAll('[data-pdd-star]')) {
-    const cls = (el.className || '').toString().toLowerCase();
-    const pcls = el.parentElement ? (el.parentElement.className || '').toString().toLowerCase() : '';
-    if (/active|selected|checked|current/.test(cls + ' ' + pcls) ||
+    const c = (cls(el) + ' ' + (el.parentElement ? cls(el.parentElement) : '')).toLowerCase();
+    if (/active|selected|checked|current/.test(c) ||
         el.getAttribute('aria-checked') === 'true' ||
         el.getAttribute('aria-selected') === 'true') {
-      activeStars.push((el.textContent || '').trim());
+      activeStars.push(clean(el.textContent));
     }
   }
   return {
-    total: total, totalText: totalText.trim(), page: page, size: size,
+    url: location.href, title: document.title,
+    total: total, totalText: mainPager ? mainPager.totalText : '',
+    page: mainPager ? mainPager.page : null, size: mainPager ? mainPager.size : null,
+    pagers: pagers.slice(0, 6), tabRaw: tabRaw.slice(0, 40),
+    starTexts: starTexts, countTexts: countTexts,
     cards: (body.match(/举报/g) || []).length,
-    tabCounts: tabCounts,
+    listSig: hash(listText), listHead: listText.slice(0, 300),
     orderSig: ids.slice(0, 3).join('|'),
-    starSig: activeStars.sort().join(','),
-    bodyLen: body.length
+    starSig: activeStars.sort().join(','), bodyLen: body.length
   };
 }
 """
+
+# 逐页统计评价卡片的星级：完全不依赖星级筛选控件。
+# 举报流程本身就用「给出了 N 星」/「用户评价分：★★★★★」判定星级，
+# 所以这里复用同一套语义，只读不点，不会触发筛选风控。
+STAR_CARDS_JS = r"""
+() => {
+  const clean = s => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const mask = s => clean(s).replace(/[0-9]{8,}/g, '<NUM>');
+  const cn = {'一':1,'二':2,'三':3,'四':4,'五':5};
+  const counts = {1:0,2:0,3:0,4:0,5:0};
+  const seen = new Set(), samples = [];
+  const collect = (onlyLeaf) => {
+    for (const el of document.querySelectorAll('body *')) {
+      if (el.offsetParent === null) continue;
+      if (onlyLeaf && el.children.length > 0) continue;
+      const t = clean(el.innerText || el.textContent || '');
+      if (!t || t.length < 4 || t.length > 600) continue;
+      let star = null;
+      const m = t.match(/给出了\s*([1-5一二三四五])\s*星/);
+      if (m) star = cn[m[1]] ? cn[m[1]] : parseInt(m[1], 10);
+      if (star === null) {
+        const m2 = t.match(/用户评价分[:：]?\s*([★☆]{1,5})/);
+        if (m2) star = (m2[1].match(/★/g) || []).length;
+      }
+      if (star === null || star < 1 || star > 5) continue;
+      const key = star + '|' + mask(t).slice(0, 90);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      counts[star] += 1;
+      if (samples.length < 6) samples.push({star: star, text: mask(t).slice(0, 140)});
+    }
+  };
+  collect(true);
+  if (Object.values(counts).reduce((a, b) => a + b, 0) === 0) collect(false);
+  return {counts: counts, samples: samples,
+          total: Object.values(counts).reduce((a, b) => a + b, 0)};
+}
+"""
+
+# 页面类型判定：必须区分「评价管理页」和「商品列表页」。
+# 后者也有分页「共有 N 条」，但那是商品数量，被误当成评价数就会出现 7/7/7。
+PAGE_KIND_JS = r"""
+() => {
+  const u = location.href || '';
+  const t = document.title || '';
+  const clean = s => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const body = (document.body && document.body.innerText) || '';
+  const links = [], seen = new Set();
+  for (const a of document.querySelectorAll(
+      'a[href*="evaluat"], a[href*="comment"], a[href*="review"]')) {
+    const href = a.getAttribute('href') || '';
+    if (!href || seen.has(href)) continue;
+    seen.add(href);
+    links.push({t: clean(a.innerText || a.textContent || '').slice(0, 30),
+                href: href});
+    if (links.length >= 12) break;
+  }
+  const goodsList = /goods_list/.test(u) || /商品列表/.test(t);
+  const reviewUrl = /evaluat|comment|review/i.test(u) && !goodsList;
+  const starTextCount = (body.match(/给出了\s*[1-5]\s*星|用户评价分/g) || []).length;
+  const reportBtnCount = (body.match(/举报/g) || []).length;
+  return {
+    url: u, title: t, goodsList: goodsList, reviewUrl: reviewUrl,
+    isReview: !goodsList && (reviewUrl || starTextCount > 0 ||
+              (/评价管理|评价举报/.test(body) && reportBtnCount >= 3)),
+    links: links, starTextCount: starTextCount,
+    reportBtnCount: reportBtnCount, head: clean(body).slice(0, 300)
+  };
+}
+"""
+
+# 诊断导出：把「页面上到底长什么样」原样留档，方便按真实 DOM 精确适配。
+# 长数字串一律打码，避免诊断文件里带出完整订单号 / 手机号。
+STAR_DIAG_JS = r"""
+() => {
+  const clean = s => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const mask = s => clean(s).replace(/[0-9]{8,}/g, '<NUM>')
+                            .replace(/([?&](?:token|access_token|sign|anti[^=]*)=)[^&\s]{8,}/gi,
+                                     '$1<TOKEN>');
+  const visible = el => { try { return el && el.offsetParent !== null; } catch (e) { return false; } };
+  const texts = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (el.children.length > 0 || !visible(el)) continue;
+    const t = clean(el.innerText || el.textContent || '');
+    if (!t || t.length > 60 || !/[星条共级评价筛选]/.test(t)) continue;
+    texts.push({t: mask(t), tag: el.tagName,
+                cls: String(el.className || '').slice(0, 120)});
+    if (texts.length >= 150) break;
+  }
+  // 星级控件真实 HTML：这是校准筛选选择器最关键的素材
+  const starEls = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (!visible(el) || el.children.length > 4) continue;
+    const t = clean(el.innerText || el.textContent || '');
+    if (!t || t.length > 40) continue;
+    if (!/[星★☆评分等级]/.test(t) && !/star|rate|score|level/i.test(String(el.className || ''))) continue;
+    starEls.push({
+      t: mask(t), tag: el.tagName,
+      cls: String(el.className || '').slice(0, 140),
+      html: mask(el.outerHTML || '').slice(0, 420),
+      parentHtml: mask((el.parentElement && el.parentElement.outerHTML) || '').slice(0, 520)
+    });
+    if (starEls.length >= 70) break;
+  }
+  const pagers = [];
+  for (const ul of document.querySelectorAll(
+      'ul[data-testid="beast-core-pagination"], [data-testid*="pagination"], [class*="pagination"]')) {
+    pagers.push(mask(ul.outerHTML || '').slice(0, 1500));
+    if (pagers.length >= 4) break;
+  }
+  const buttons = [];
+  for (const el of document.querySelectorAll(
+      'button,[role="button"],[role="tab"],[role="radio"],[class*="tab"],[class*="select"],option')) {
+    if (!visible(el)) continue;
+    buttons.push({
+      t: mask(clean(el.innerText || el.textContent || '').slice(0, 50)),
+      cls: String(el.className || '').slice(0, 120),
+      sel: el.getAttribute('aria-selected'), chk: el.getAttribute('aria-checked')
+    });
+    if (buttons.length >= 100) break;
+  }
+  // 页面实际发过哪些接口：用于找出评价列表 API 与它的星级参数
+  const resources = [];
+  try {
+    for (const e of performance.getEntriesByType('resource')) {
+      if (!/xmlhttprequest|fetch/i.test(e.initiatorType || '')) continue;
+      resources.push(mask(e.name || '').slice(0, 220));
+      if (resources.length >= 60) break;
+    }
+  } catch (e) {}
+  const frames = [];
+  for (const f of document.querySelectorAll('iframe,frame')) {
+    frames.push(mask(f.getAttribute('src') || f.name || '').slice(0, 200));
+    if (frames.length >= 10) break;
+  }
+  const globals = {};
+  for (const k of ['__INITIAL_STATE__','__NEXT_DATA__','__NUXT__','__PDD_STATE__']) {
+    try { if (window[k]) globals[k] = mask(JSON.stringify(window[k]).slice(0, 4000)); }
+    catch (e) {}
+  }
+  return {
+    url: location.href, title: document.title,
+    bodyHead: mask((document.body.innerText || '').slice(0, 2500)),
+    htmlHead: mask((document.documentElement.outerHTML || '').slice(0, 3000)),
+    texts: texts, starEls: starEls, pagers: pagers, buttons: buttons,
+    resources: resources, frames: frames, globals: globals
+  };
+}
+"""
+
+# ------------------------------------------------------------------
+# 星级数量：优先读评价接口返回的 JSON，其次读页面星级标签，
+# 最后才用「逐个筛选 + 分页总数」。任何来源拿不准都不写假数字。
+# ------------------------------------------------------------------
+_API_KEYWORDS = ("evaluate", "comment", "review", "appraise", "remark",
+                 "feedback", "goods/list", "getlist")
+_STAR_FIELD_RE = re.compile(r"^(star|starlevel|star_level|score|level|rating|grade|starnum)$", re.I)
+_COUNT_FIELD_RE = re.compile(r"^(count|num|cnt|total|totalcount|total_num|totalnum|"
+                             r"totalsize|totalrows|reviewnum|commentnum|evaluatenum)$", re.I)
+_TOTAL_FIELD_RE = re.compile(r"^(total|totalcount|total_count|totalnum|total_num|"
+                             r"totalsize|total_size|totalrows|cnt)$", re.I)
+
+
+def _is_count(v):
+    """合理条数：非负整数、不是布尔、不是订单号那种巨大数字。"""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    return 0 <= v < 1000000 and float(v).is_integer()
+
+
+def parse_star_payload(data):
+    """从评价接口 JSON 里挖「星级计数」与「总数」。
+
+    兼容三种常见形态：
+      1. {"1": 12, "2": 3, "3": 5} / {"star1Count": 12, ...}
+      2. [{"star": 1, "count": 12}, {"level": 2, "num": 3}, ...]
+      3. 任意层级的 {"total": 381} / {"totalCount": 381}
+    返回 (star_map or None, totals list)。
+    """
+    maps, totals = [], []
+
+    def walk(o, depth=0):
+        if depth > 8:
+            return
+        if isinstance(o, list):
+            sm = {}
+            for item in o[:200]:
+                if not isinstance(item, dict):
+                    continue
+                star = cnt = None
+                for k, v in item.items():
+                    ks = str(k)
+                    if _STAR_FIELD_RE.match(ks) and _is_count(v) and 1 <= int(v) <= 5:
+                        star = int(v)
+                    if _COUNT_FIELD_RE.match(ks) and _is_count(v):
+                        cnt = int(v)
+                if star and cnt is not None:
+                    sm[star] = cnt
+            if all(k in sm for k in (1, 2, 3)):
+                maps.append(sm)
+            for item in o[:200]:
+                walk(item, depth + 1)
+            return
+        if not isinstance(o, dict):
+            return
+        sm = {}
+        for k, v in o.items():
+            ks = str(k)
+            if ks in ("1", "2", "3", "4", "5") and _is_count(v):
+                sm[int(ks)] = int(v)
+            elif "star" in ks.lower() and _is_count(v) and re.search(r"[1-5]", ks) and \
+                    re.search(r"count|num|total|cnt", ks, re.I):
+                sm[int(re.search(r"[1-5]", ks).group())] = int(v)
+            if _TOTAL_FIELD_RE.match(ks) and _is_count(v):
+                totals.append(int(v))
+            if isinstance(v, (dict, list)):
+                walk(v, depth + 1)
+            elif isinstance(v, str) and v[:1] in "{[" and len(v) < 200000:
+                try:
+                    walk(json.loads(v), depth + 1)
+                except Exception:
+                    pass
+        if all(k in sm for k in (1, 2, 3)):
+            maps.append(sm)
+
+    try:
+        walk(data)
+    except Exception:
+        pass
+    good = [m for m in maps if any(m.get(k, 0) > 0 for k in (1, 2, 3))]
+    best = (good or maps or [None])[-1]
+    return best, totals[:12]
+
+
+def pick_tab_counts(raw):
+    """从 DOM 候选里裁决 1/2/3 星数量；有冲突或缺失就返回空，绝不猜。
+
+    同一个星级出现多个候选时，只比较「最像筛选标签」的那一组；
+    组内数值不一致就判定冲突，宁可显示「—」也不随便挑一个。
+    """
+    if not isinstance(raw, list):
+        return {}
+    by_star = {}
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        try:
+            star, n = int(c.get("star")), int(c.get("n"))
+        except (TypeError, ValueError):
+            continue
+        if star not in (1, 2, 3) or n < 0 or n > 999999:
+            continue
+        rank = int(c.get("filterish") or 0)
+        by_star.setdefault(star, []).append((rank, n))
+    out = {}
+    for star in (1, 2, 3):
+        items = by_star.get(star) or []
+        if not items:
+            return {}
+        top = max(r for r, _ in items)
+        vals = {n for r, n in items if r == top}
+        if len(vals) != 1:
+            return {}
+        out[star] = vals.pop()
+    return out
+
 
 QR_VISIBLE_JS = r"""
 () => {
@@ -348,7 +662,15 @@ class ShopSession(object):
         self.stop_report = False
         self.online = False
         self.stars = {1: 0, 2: 0, 3: 0}
-        self.stars_ok = False   # False = 数量待确认，界面数字后加 ?
+        self.stars_ok = False   # False = 数量未确认，界面显示「—」而不是假数字
+        self.stars_source = ""  # api / tab / pager / none，便于排查
+        self.star_note = ""
+        self.api_hints = []     # 最近若干条评价接口响应摘要
+        self.api_urls = []      # 页面实际发过的 XHR 地址（诊断用）
+        self._diag_uploaded_at = 0.0   # 失败诊断自动回传去重
+        self.page_kind = ""        # review / goods_list / login / unknown
+        self.page_url = ""         # 最近一次实际落地地址
+        self.nav_log = []          # 进入评价页的尝试记录（诊断用）
         self.reported = 0
         self.status = "未登录"
         self.message = ""
@@ -380,6 +702,8 @@ class ShopSession(object):
             "star2": self.stars.get(2, 0),
             "star3": self.stars.get(3, 0),
             "stars_ok": bool(self.stars_ok),
+            "stars_source": self.stars_source,
+            "star_note": self.star_note,
             "reported": self.reported,
             "last_check": self.last_check,
             "daily_limit": bool(self.daily_limit),
@@ -430,6 +754,11 @@ class ShopSession(object):
             kwargs["storage_state"] = storage
         self.context = await browser.new_context(**kwargs)
         self.page = await self.context.new_page()
+        # 评价列表的真实数字通常在接口 JSON 里；后台静默收集，不干扰业务请求
+        try:
+            self.page.on("response", self._on_api_response)
+        except Exception:
+            pass
         self.reporter = self.core.PinduoduoReviewReporter()
         self.reporter.browser = browser
         self.reporter.context = self.context
@@ -609,6 +938,8 @@ class ShopSession(object):
         try:
             await self.ensure_context(force=True)
             await self._enter_review_page()
+            if self.page_kind == "login":
+                return False
             self.online = True
             await self.refresh_stars()
             self.online = True
@@ -649,6 +980,8 @@ class ShopSession(object):
         try:
             await self.ensure_context(force=True)
             await self._enter_review_page()
+            if self.page_kind == "login":
+                return
             self.online = True
             await self.save_login_state()
             await self.refresh_stars()
@@ -659,27 +992,95 @@ class ShopSession(object):
         except Exception as e:
             self.set("掉线，请重新扫码", str(e)[:160], online=False)
 
-    async def _enter_review_page(self):
-        """轻量进入评价管理页：不做核心脚本那一整套诊断截图，避免每次心跳都刷屏。"""
+    async def _page_kind(self):
+        """读当前页面类型：评价页 / 商品列表 / 登录页，以及侧栏真实入口。"""
         if not self.page:
-            raise RuntimeError("页面未就绪")
-        await self.page.goto(self.core.REVIEW_MANAGE_URL,
-                             wait_until="domcontentloaded", timeout=30000)
+            return {}
         try:
-            await self.page.wait_for_load_state("networkidle", timeout=12000)
-        except Exception:
-            pass
-        await asyncio.sleep(2)
-        url = (self.page.url or "").lower()
-        if "login" in url or "passport" in url:
+            return await self.page.evaluate(PAGE_KIND_JS)
+        except Exception as e:
+            return {"error": str(e)[:120]}
+
+    async def _enter_review_page(self):
+        """确保浏览器真的停在评价管理页。
+
+        旧地址 /goods/evaluate/list 已被改版重定向到「商品列表」，那边的
+        「共有 7 条」是 7 个在售商品。这里按候选地址逐个尝试并校验落地页，
+        还不行就从侧栏真实 href 再跳。返回 bool，不抛异常，避免把「页面
+        没进去」误判成「店铺掉线」。
+        """
+        if not self.page:
+            return False
+        kind = await self._page_kind()
+        self.page_url = kind.get("url", "")
+        low = self.page_url.lower()
+        if "login" in low or "passport" in low:
+            self.page_kind = "login"
             self.online = False
-            raise RuntimeError("登录态已失效，需要重新扫码")
-        # 登录瞬间若没抓到店铺名，进入后台页面后再兜底抓一次
-        try:
-            await self._auto_name_if_needed()
-        except Exception:
-            pass
-        return True
+            self.set("掉线，请重新扫码", "登录态已失效")
+            return False
+        self.page_kind = ("review" if kind.get("isReview") else
+                          "goods_list" if kind.get("goodsList") else "unknown")
+        if kind.get("isReview"):
+            self.nav_log = ["已在评价管理页"]
+            try:
+                await self._auto_name_if_needed()
+            except Exception:
+                pass
+            return True
+
+        urls = list(getattr(self.core, "REVIEW_PAGE_URLS",
+                            [getattr(self.core, "REVIEW_MANAGE_URL", "")]))
+        for lk in kind.get("links") or []:
+            h = str(lk.get("href") or "")
+            if h.startswith("//"):
+                h = "https:" + h
+            elif h.startswith("/"):
+                h = "https://mms.pinduoduo.com" + h
+            if h.startswith("http") and h not in urls:
+                urls.append(h)
+
+        nav_log = []
+        for url in urls[:8]:
+            if not url:
+                continue
+            try:
+                await self.page.goto(url, wait_until="domcontentloaded",
+                                     timeout=30000)
+                try:
+                    await self.page.wait_for_load_state("networkidle",
+                                                        timeout=10000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.2)
+            except Exception as e:
+                nav_log.append("%s→异常:%s" % (url.rsplit("/", 1)[-1][:36],
+                                               str(e)[:36]))
+                continue
+            k2 = await self._page_kind()
+            cur = k2.get("url", "")
+            nav_log.append("%s→%s" % (url.rsplit("/", 1)[-1][:36],
+                                      cur.rsplit("/", 1)[-1][:36]))
+            if "login" in cur.lower() or "passport" in cur.lower():
+                self.page_kind, self.page_url, self.nav_log = "login", cur, nav_log
+                self.online = False
+                self.set("掉线，请重新扫码", "登录态已失效")
+                return False
+            if k2.get("isReview"):
+                self.page_kind, self.page_url, self.nav_log = "review", cur, nav_log
+                try:
+                    await self._auto_name_if_needed()
+                except Exception:
+                    pass
+                return True
+
+        final = await self._page_kind()
+        self.page_url = final.get("url", "")
+        self.page_kind = ("goods_list" if final.get("goodsList") else "unknown")
+        self.nav_log = nav_log
+        self.set("在线", "未进入评价管理页（当前：%s）" %
+                 (final.get("title") or self.page_url.rsplit("/", 1)[-1][:36]))
+        return False
 
     async def heartbeat(self):
         """轻量在线心跳：续期 cookie + 掉线检测，不刷新星级（星级单独按更长的周期查）。"""
@@ -689,6 +1090,8 @@ class ShopSession(object):
             if not self.context:
                 await self.ensure_context(force=True)
             await self._enter_review_page()
+            if self.page_kind == "login":
+                return
             self.online = True
             self._last_heartbeat = time.time()
             await self.save_login_state()
@@ -707,7 +1110,7 @@ class ShopSession(object):
         self._last_star_check = time.time()
 
     async def _star_snapshot(self):
-        """一次读取列表指纹 + 分页总数 + 星级标签数量。"""
+        """一次读取页面快照：分页、星级标签候选、列表指纹。"""
         if not self.page:
             return {}
         try:
@@ -715,84 +1118,356 @@ class ShopSession(object):
         except Exception:
             return {}
 
-    async def _wait_star_data(self, star, before, timeout=14):
-        """筛选后必须等到列表真的换了数据、且总数连续稳定，才采纳读数。
+    # ---------- 评价接口响应：最可信的数字来源 ----------
+    def _on_api_response(self, response):
+        """同步回调里只做筛选，读响应体交给后台任务，绝不阻塞页面。"""
+        try:
+            url = response.url or ""
+            low = url.lower()
+            # 所有 XHR 地址都留档：真实接口名常常不含 evaluate/comment 等关键词
+            if "/api/" in low or any(k in low for k in _API_KEYWORDS):
+                if url not in self.api_urls:
+                    self.api_urls.append(url[:300])
+                    del self.api_urls[:-60]
+            if not any(k in low for k in _API_KEYWORDS):
+                return
+            ct = ""
+            try:
+                ct = (response.headers or {}).get("content-type", "")
+            except Exception:
+                pass
+            if "json" not in ct.lower() or getattr(response, "status", 200) >= 400:
+                return
+            asyncio.ensure_future(self._absorb_response(response, url))
+        except Exception:
+            pass
 
-        旧实现切完星级立刻读分页，接口还没返回，三个星级读到的都是
-        同一个旧总数（截图里的 7 / 7 / 7 就是这么来的）。
+    async def _absorb_response(self, response, url):
+        try:
+            raw = await response.text()
+            if not raw or len(raw) > 400000:
+                return
+            data = json.loads(raw)
+        except Exception:
+            return
+        star_map, totals = parse_star_payload(data)
+        self.api_hints.append({
+            "ts": time.time(), "url": url[:200],
+            "starMap": star_map or {},
+            "totals": totals,
+            "rawHead": re.sub(r"\d{8,}", "<NUM>", raw[:300]),
+        })
+        del self.api_hints[:-16]
+
+    def _recent_star_map(self, max_age=90, since=0):
+        cut = time.time() - max_age
+        for h in reversed(self.api_hints[since:]):
+            sm = h.get("starMap") or {}
+            if h.get("ts", 0) >= cut and all(k in sm for k in (1, 2, 3)):
+                return {k: max(0, int(sm[k])) for k in (1, 2, 3)}
+        return None
+
+    def _totals_since(self, mark):
+        out = []
+        for h in self.api_hints[mark:]:
+            out.extend(h.get("totals") or [])
+        return out
+
+    def _apply_stars(self, values, source, ok, note=""):
+        # 不可靠时连内部值也清零，避免顶部统计卡把假数字加总（7+7+7=21）
+        if not ok:
+            values = {1: 0, 2: 0, 3: 0}
+        for k in (1, 2, 3):
+            self.stars[k] = max(0, int(values.get(k, 0) or 0))
+        self.stars_ok = bool(ok)
+        self.stars_source = source if ok else "none"
+        self.star_note = str(note)[:220]
+        self.last_check = time.strftime("%H:%M:%S")
+        label = {"api": "评价接口", "tab": "星级标签",
+                 "cards": "逐页统计评价卡片", "pager": "筛选分页"}.get(source, source)
+        self.set(message=("1/2/3 星数量已更新（来源：%s）" % label) if ok else
+                 "未读到可信的评价数量，正在自动回传页面诊断；可点「刷新数量」重试")
+        self.engine.publish(self)
+
+    async def count_stars_by_cards(self, max_pages=12, max_seconds=55):
+        """逐页统计评价卡片的星级，完全不依赖星级筛选控件。
+
+        举报流程本身就用「给出了 N 星」/「用户评价分：★★★★★」判定星级，
+        这里复用同一套语义，只读不点，不触发筛选风控。返回 None 表示一条都没读到。
         """
-        deadline = time.time() + timeout
-        last_total, stable = None, 0
-        before_total = before.get("total")
-        before_orders = before.get("orderSig") or ""
-        changed = False
-        while time.time() < deadline:
+        r = self.reporter
+        if not r or not self.page:
+            return None
+        deadline = time.time() + max_seconds
+        counts, samples = {1: 0, 2: 0, 3: 0}, []
+        scanned, pages, total_rows = 0, 0, None
+        seen_pages = set()
+        for _ in range(max_pages):
+            if time.time() > deadline:
+                break
             snap = await self._star_snapshot()
-            orders = snap.get("orderSig") or ""
-            total = snap.get("total")
-            if (orders and orders != before_orders) or \
-                    (total is not None and total != before_total):
-                changed = True
-            if changed and total is not None:
-                if total == last_total:
-                    stable += 1
-                    if stable >= 2:
-                        return total, True, snap
-                else:
-                    stable = 0
-                    last_total = total
-            await asyncio.sleep(0.7)
-        last = await self._star_snapshot()
-        # 超时也给出当前读数，但 ok=False 让界面标「?」，绝不静默当成准确值
-        return (last_total if last_total is not None else last.get("total")), \
-            False, last
+            sig = snap.get("listSig")
+            if sig and sig in seen_pages:
+                break                      # 没翻成功，别把同一页重复计一遍
+            if sig:
+                seen_pages.add(sig)
+            try:
+                js = await self.page.evaluate(STAR_CARDS_JS)
+            except Exception:
+                js = {}
+            c = js.get("counts") or {}
+            page_n = 0
+            for k in (1, 2, 3, 4, 5):
+                try:
+                    v = int(c.get(str(k), c.get(k, 0)) or 0)
+                except (TypeError, ValueError):
+                    v = 0
+                page_n += v
+                if k in counts:
+                    counts[k] += v
+            for s in (js.get("samples") or [])[:3]:
+                if len(samples) < 6:
+                    samples.append(s)
+            if page_n == 0:
+                # 兜底：核心脚本的精确卡片识别（以「举报」链接为锚点）
+                try:
+                    cards = await r._collect_review_cards()
+                except Exception:
+                    cards = []
+                for item in (cards or []):
+                    page_n += 1
+                    try:
+                        star = r._detect_card_star(str(item.get("text") or ""))
+                    except Exception:
+                        star = None
+                    if star in counts:
+                        counts[star] += 1
+            if page_n == 0:
+                break
+            scanned += page_n
+            pages += 1
+            try:
+                ps = await r._pager_state()
+            except Exception:
+                ps = {}
+            if isinstance(ps.get("totalRows"), int) and ps["totalRows"] > 0:
+                total_rows = ps["totalRows"]
+            if total_rows and scanned >= total_rows:
+                break
+            if ps.get("found") and ps.get("nextDisabled"):
+                break
+            try:
+                moved = await r.go_to_next_page()
+            except Exception:
+                moved = False
+            if not moved:
+                break
+            await asyncio.sleep(0.35)
+        if scanned == 0:
+            return None
+        coverage = (min(1.0, float(scanned) / total_rows)
+                    if total_rows else (1.0 if pages == 1 else None))
+        return {"counts": counts, "scanned": scanned, "pages": pages,
+                "totalRows": total_rows, "coverage": coverage,
+                "samples": samples}
+
+    async def _build_diag_payload(self, reason=""):
+        """采集真实页面素材。长数字一律打码，不含密码、密钥、完整订单号。"""
+        try:
+            page_info = await self.page.evaluate(STAR_DIAG_JS) if self.page else {}
+        except Exception as e:
+            page_info = {"error": str(e)[:200]}
+        try:
+            card_probe = await self.page.evaluate(STAR_CARDS_JS) if self.page else {}
+        except Exception:
+            card_probe = {}
+        try:
+            import updater
+            ver = updater.version_info()
+        except Exception:
+            ver = {}
+        return {
+            "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "shop": self.name, "reason": reason,
+            "appVersion": ver.get("version"), "appLabel": ver.get("label"),
+            "currentStars": {str(k): self.stars.get(k) for k in (1, 2, 3)},
+            "starsOk": self.stars_ok, "starsSource": self.stars_source,
+            "starNote": self.star_note,
+            "snapshot": await self._star_snapshot(),
+            "pageKind": getattr(self, "page_kind", ""),
+            "pageUrl": getattr(self, "page_url", ""),
+            "navLog": getattr(self, "nav_log", []),
+            "page": page_info, "cardProbe": card_probe,
+            "apiUrls": self.api_urls[-30:], "apiHints": self.api_hints[-10:],
+        }
+
+    async def upload_star_diag(self, reason="", force=False):
+        """把诊断自动回传到云端，用户不用再手动找文件、传文件。"""
+        if not force and time.time() - self._diag_uploaded_at < 1800:
+            return False
+        try:
+            import base64
+            import zlib
+            from .license import LicenseClient
+            payload = await self._build_diag_payload(reason)
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            packed = base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
+            res = LicenseClient().call(
+                "client_diag",
+                {"shop": self.name, "reason": reason, "packed": packed,
+                 "size": len(raw)}, timeout=20)
+        except Exception as e:
+            self.set(message="诊断回传异常：%s" % str(e)[:100])
+            return False
+        self._diag_uploaded_at = time.time()
+        if res.get("ok"):
+            self.set(message="页面诊断已自动回传（编号 %s），无需手动发文件" %
+                             str(res.get("diagId", ""))[:16])
+        else:
+            self.set(message="诊断回传失败：%s" % str(res.get("msg", ""))[:90])
+        return bool(res.get("ok"))
 
     async def refresh_stars(self):
-        """读取 1/2/3 星数量：优先标签自带数量，否则逐个筛选并等真实刷新。
+        """读取 1/2/3 星数量，四级来源逐级降级。
 
-        核心脚本一行未改；所有等待与校验都在 GUI 侧完成，举报流程不受影响。
+          1. 评价接口 JSON 里的星级统计（最准）
+          2. 页面星级标签自带数量
+          3. 逐页统计评价卡片星级（不依赖筛选控件，最通用）
+          4. 逐个筛选后读分页总数
+        只有「三次读数相同且列表从未变化」才判定为旧数据；其余能读到就显示，
+        并把来源写进状态栏。全部失败时自动回传页面诊断，便于按真实 DOM 适配。
         """
         if not self.reporter or not self.page:
             return
         r = self.reporter
-        first = await self._star_snapshot()
-        tabs = first.get("tabCounts") or {}
-        # 不少列表页的星级 tab 直接带数量，一次读取最准、也最省平台请求
-        if all(str(k) in tabs for k in (1, 2, 3)):
-            for star in (1, 2, 3):
-                self.stars[star] = int(tabs[str(star)])
-            self.stars_ok = True
-            self.last_check = time.strftime("%H:%M:%S")
-            self.engine.publish(self)
+        self.set(message="正在读取 1/2/3 星数量…")
+
+        # 页面守卫：旧地址会被重定向到「商品列表」，那边的「共有 7 条」是
+        # 7 个在售商品。不确认在评价管理页，绝不读分页、绝不写任何数字。
+        try:
+            await self._enter_review_page()
+        except Exception as e:
+            self.page_kind = "unknown"
+            self.set(message="进入评价页异常：%s" % str(e)[:80])
+        if getattr(self, "page_kind", "") != "review":
+            cn = {"goods_list": "商品列表页", "login": "登录页"}.get(
+                self.page_kind, "其它页面")
+            tail = (getattr(self, "page_url", "") or "").rsplit("/", 1)[-1][:36]
+            note = "当前停在%s（%s），未能进入评价管理页，数量未读取" % (cn, tail)
+            self._apply_stars({}, "none", False, note)
+            await self.upload_star_diag(reason="页面守卫：" + note, force=True)
             return
 
-        reliable = True
+        snap = await self._star_snapshot()
+        for _ in range(4):
+            if self._recent_star_map():
+                break
+            await asyncio.sleep(0.5)
+
+        # 1) 接口直接给出各星级数量
+        sm = self._recent_star_map()
+        if sm:
+            self._apply_stars(sm, "api", True, "来自评价接口统计")
+            return
+
+        # 2) 页面星级标签自带数量
+        tabs = pick_tab_counts(snap.get("tabRaw"))
+        if tabs:
+            self._apply_stars(tabs, "tab", True, "来自页面星级标签")
+            return
+
+        # 3) 逐页统计评价卡片：星级筛选控件认不出来也能拿到数字
+        try:
+            card = await self.count_stars_by_cards()
+        except Exception as e:
+            card = None
+            self.set(message="逐页统计异常：%s" % str(e)[:60])
+        if card and card.get("scanned", 0) > 0:
+            cov = card.get("coverage")
+            note = "逐页统计 %d 条评价（%d 页）" % (card["scanned"], card["pages"])
+            if isinstance(cov, float) and cov < 0.8:
+                note += "，约覆盖 %d%%（分页共 %s 条）" % (
+                    int(cov * 100), card.get("totalRows"))
+            if card.get("samples"):
+                note += "；样例：" + "，".join(
+                    "%s星" % s.get("star") for s in card["samples"][:3])
+            self._apply_stars(card["counts"], "cards", True, note)
+            return
+
+        # 4) 逐个筛选 + 分页总数。筛选状态未确认不再一票否决，
+        #    改看「列表指纹是否真的变了」，避免把能读到的数据也否掉。
+        vals, notes, missing = {}, [], 0
+        changed_any = False
         for star in (1, 2, 3):
             before = await self._star_snapshot()
+            mark = len(self.api_hints)
+            verified = False
             try:
                 await r.filter_by_star(star)
+                verified = bool(getattr(r, "_star_filter_verified", False))
+            except Exception as e:
+                notes.append("%s星筛选异常:%s" % (star, str(e)[:50]))
+            sm2 = self._recent_star_map(max_age=30, since=mark)
+            if sm2:
+                self._apply_stars(sm2, "api", True, "筛选后来自评价接口统计")
+                return
+            try:
+                ps = await r._pager_state()
             except Exception:
-                pass
-            n, ok, after = await self._wait_star_data(star, before)
+                ps = {}
+            after = await self._star_snapshot()
+            n = ps.get("totalRows")
             if n is None:
-                try:
-                    pages = await r._detect_total_pages(wait_stable=False)
-                except Exception:
-                    pages = 0
-                size = after.get("size") or 10
-                n = pages * size if pages else 0
-                ok = False
-            self.stars[star] = max(0, int(n or 0))
-            reliable = reliable and ok
+                n = after.get("total")
+            if n is None:
+                tts = self._totals_since(mark)
+                n = max(tts) if tts else None
+            changed = bool(before.get("listSig") and after.get("listSig") and
+                           before.get("listSig") != after.get("listSig"))
+            changed_any = changed_any or changed
+            if n is None:
+                missing += 1
+            vals[star] = max(0, int(n or 0))
+            notes.append("%s星=%s%s" % (
+                star, n, "" if (verified or changed) else "(筛选未确认)"))
             self.engine.publish(self)
             await asyncio.sleep(0.4)
 
-        vals = [self.stars[i] for i in (1, 2, 3)]
-        if vals[0] == vals[1] == vals[2] and vals[0] > 0 and not reliable:
-            reliable = False
-        self.stars_ok = reliable
-        self.last_check = time.strftime("%H:%M:%S")
-        self.engine.publish(self)
+        same = len(set(vals.values())) == 1
+        if same and not changed_any:
+            self._apply_stars(vals, "none", False,
+                              "三次读数均为 %s 且列表未变化（星级筛选控件未识别），"
+                              "判断为同一份「全部评价」数据" % list(vals.values())[0])
+        elif missing == 0 and (changed_any or len(set(vals.values())) > 1):
+            self._apply_stars(vals, "pager", True, "；".join(notes))
+        else:
+            self._apply_stars(vals, "none", False, "；".join(notes))
+
+        if not self.stars_ok:
+            # 不打断主流程：失败时后台自动回传一次真实页面结构
+            try:
+                await self.upload_star_diag(
+                    reason="星级数量读取失败：" + (self.star_note or "未知"))
+            except Exception:
+                pass
+
+    async def export_star_diag(self):
+        """本地留档 + 自动回传云端：用户不必再手动找文件、发文件。"""
+        payload = await self._build_diag_payload("用户手动导出")
+        safe = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5_-]", "_", self.name)[:24] or "shop"
+        fname = "星级诊断_%s_%s.json" % (safe, time.strftime("%Y%m%d_%H%M%S"))
+        path = ""
+        try:
+            path = os.path.join(self.store.shop_dir(self.id), fname)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.set(message="本地诊断保存失败：%s" % str(e)[:120])
+        ok = await self.upload_star_diag(reason="用户手动导出", force=True)
+        if path:
+            self.set(message="诊断已保存并%s回传：%s（右键「打开店铺目录」可找到）" %
+                             ("成功" if ok else "未能", fname))
+        return path
 
     # ---------- 举报任务 ----------
     async def run_report(self):

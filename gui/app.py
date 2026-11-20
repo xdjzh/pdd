@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 from .engine import Engine
-from .state import ShopStore
+from .state import ShopStore, app_base_dir
 from .theme import (PALETTES, Chip, PillButton, StatCard, draw_icon,
                     font_family, gradient, load_theme, mix, round_rect,
                     save_theme)
@@ -67,6 +67,90 @@ def _sizes():
             "md": base, "lg": base + 2, "xl": base + 6, "num": base + 12}
 
 
+# ------------------------------------------------------------------
+# 版本与更新：引导壳 updater.py 在启动时静默装补丁，这里负责把结果
+# 「说清楚」——显示当前版本、允许手动检查、发现新版主动下载并提示。
+# ------------------------------------------------------------------
+_BASE_TAG = "v1.0.0 基础版"
+
+
+def _ver_state():
+    """当前真正生效的版本（有补丁读补丁，没有就读 exe 内置基线）。"""
+    try:
+        import updater
+        v = updater.version_info()
+        return {
+            "version": int(v.get("version") or 0),
+            "base": int(v.get("base") or 0),
+            "patched": bool(v.get("patched")),
+            "label": str(v.get("label") or ""),
+            "appliedAt": int(v.get("appliedAt") or 0),
+        }
+    except Exception:
+        return {"version": 0, "base": 0, "patched": False,
+                "label": "", "appliedAt": 0}
+
+
+def _ver_short(v=None):
+    v = v or _ver_state()
+    m = re.match(r"^(v?\d+(?:\.\d+)+)", (v.get("label") or "").strip())
+    tag = m.group(1) if m else _BASE_TAG
+    if v.get("patched"):
+        return "%s · 热更新 %s" % (tag, v.get("version") or "")
+    return "%s · 内置版 %s" % (tag, v.get("version") or "")
+
+
+def _ver_detail(v=None):
+    v = v or _ver_state()
+    lines = [
+        "当前运行版本：%s" % ((v.get("label") or "").strip() or _BASE_TAG),
+        "版本号：%s" % (v.get("version") or "（未读取到）"),
+        "代码来源：%s" % ("云端热更新" if v.get("patched") else "exe 内置基线"),
+        "exe 内置基线：%s" % (v.get("base") or "—"),
+    ]
+    if v.get("appliedAt"):
+        lines.append("热更新安装时间：%s" %
+                     time.strftime("%Y-%m-%d %H:%M",
+                                   time.localtime(v["appliedAt"])))
+    lines.append("更新方式：每次启动自动检查；也可点「检查更新」手动检查。")
+    return "\n".join(lines)
+
+
+def _endpoint():
+    try:
+        import updater
+        ep = updater.endpoint()
+        if ep:
+            return ep
+    except Exception:
+        pass
+    try:
+        from .license import LicenseClient
+        ep = LicenseClient().endpoint
+        if ep:
+            return ep
+    except Exception:
+        pass
+    return ""
+
+
+def _post_update(url, action, payload=None, timeout=8):
+    import json
+    import urllib.request
+    body = json.dumps(dict(action=action, **(payload or {})),
+                      ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(r.read().decode("utf-8", "ignore"))
+    if isinstance(d, dict) and isinstance(d.get("body"), str):
+        try:
+            d = json.loads(d["body"])
+        except Exception:
+            pass
+    return d if isinstance(d, dict) else {}
+
+
 class App(object):
     def __init__(self, root, store, license_session=None):
         self.root = root
@@ -86,11 +170,16 @@ class App(object):
         self._nav_hover = None
         self._closing = False
         self._tick_started = False
+        # 启动那一刻真正跑起来的版本（下载完补丁后也不会误显示成新版）
+        self._running_ver = _ver_state()
+        self._checking_update = False
         self._build_ui()
         self.engine.start()
         if not self._tick_started:
             self._tick_started = True
             self.root.after(400, self._tick)
+        # 启动后静默检查一次；刚装过热更新或云端有新版都会主动弹窗告知
+        self.root.after(1200, lambda: self._check_update(manual=False))
 
     # ---------- 界面骨架（可重复调用，用于切换主题时整体重绘） ----------
     def _build_ui(self):
@@ -148,6 +237,12 @@ class App(object):
             else "数据保存在 pdd_data")
         tk.Label(status, textvariable=self.account_var, bg=t["bg"],
                  fg=t["muted"], font=(self.fam, self.fs["xs"])).pack(side=tk.RIGHT)
+        self.version_var = tk.StringVar(value=_ver_short(self._running_ver))
+        ver_label = tk.Label(status, textvariable=self.version_var, bg=t["bg"],
+                             fg=t["accent"], cursor="hand2",
+                             font=(self.fam, self.fs["xs"]))
+        ver_label.pack(side=tk.RIGHT, padx=(0, 14))
+        ver_label.bind("<Button-1>", lambda e: self.do_version_info())
 
         self.pages = {"report": self._build_report_page(self.content)}
         for key in ("dsr", "traffic", "profit"):
@@ -281,8 +376,9 @@ class App(object):
             c.create_text(w - 26, ty + 20, text="◐", anchor="e",
                           fill=t["sidebar_sub"], font=(self.fam, self.fs["md"]))
         self._nav_hit.append((14, ty, w - 14, ty + 40, "theme"))
-        c.create_text(22, h - 18, text="v1.1 · 更多功能规划中", anchor="w",
-                      fill=t["sidebar_sub"], font=(self.fam, self.fs["xs"]))
+        c.create_text(22, h - 18, text=_ver_short(self._running_ver),
+                      anchor="w", fill=t["sidebar_sub"],
+                      font=(self.fam, self.fs["xs"]))
 
     @staticmethod
     def _hit(hits, x, y):
@@ -431,6 +527,8 @@ class App(object):
                    **kw).pack(side=tk.LEFT, padx=(0, 8))
         PillButton(bar, t, "停止", self.do_stop, kind="danger",
                    **kw).pack(side=tk.LEFT)
+        PillButton(bar, t, "检查更新", self.do_check_update,
+                   kind="ghost", **kw).pack(side=tk.RIGHT, padx=(0, 8))
         PillButton(bar, t, "使用说明", self.do_help, kind="ghost",
                    **kw).pack(side=tk.RIGHT)
         return page
@@ -515,6 +613,8 @@ class App(object):
 
         ops = self._menu(m)
         ops.add_command(label="刷新 1/2/3 星数量", command=self.do_refresh)
+        ops.add_command(label="上报页面诊断（自动回传）",
+                        command=self.do_star_diag)
         ops.add_command(label="开始举报", command=self.do_start)
         ops.add_command(label="全部开始", command=self.do_start_all)
         ops.add_command(label="停止", command=self.do_stop)
@@ -541,6 +641,9 @@ class App(object):
         m.add_cascade(label="账号", menu=acc)
 
         helpm = self._menu(m)
+        helpm.add_command(label="检查更新", command=self.do_check_update)
+        helpm.add_command(label="版本信息", command=self.do_version_info)
+        helpm.add_separator()
         helpm.add_command(label="使用说明", command=self.do_help)
         m.add_cascade(label="帮助", menu=helpm)
         self.root.config(menu=m)
@@ -548,6 +651,7 @@ class App(object):
         self.popup = self._menu(self.root)
         self.popup.add_command(label="扫码登录", command=self.do_login)
         self.popup.add_command(label="刷新数量", command=self.do_refresh)
+        self.popup.add_command(label="上报页面诊断", command=self.do_star_diag)
         self.popup.add_command(label="开始举报", command=self.do_start)
         self.popup.add_command(label="停止", command=self.do_stop)
         self.popup.add_separator()
@@ -588,9 +692,9 @@ class App(object):
         for sid, st in states.items():
             dot = "●  " if st.get("online") else "○  "
             stars = [st.get("star1", 0), st.get("star2", 0), st.get("star3", 0)]
-            # 筛选后数据没确认刷新时，数字后加 ? 提示「待确认」，不静默给假数
-            if not st.get("stars_ok", True):
-                stars = ["%s?" % x for x in stars]
+            # 没拿到可信读数就显示「—」；旧版会把同一个旧分页值填进三列（7/7/7）
+            if not st.get("stars_ok", False):
+                stars = ["—", "—", "—"]
             values = (st["name"], dot + str(st["status"]),
                       stars[0], stars[1], stars[2], st["reported"])
             if sid in existing:
@@ -609,8 +713,9 @@ class App(object):
         online = sum(1 for st in states.values() if st.get("online"))
         pending = reported = 0
         for st in states.values():
-            for k in ("star1", "star2", "star3"):
-                pending += self._as_int(st.get(k))
+            if st.get("stars_ok", False):
+                for k in ("star1", "star2", "star3"):
+                    pending += self._as_int(st.get(k))
             reported += self._as_int(st.get("reported"))
         self.stat_online.set_value(online, "当前保持在线")
         self.stat_pending.set_value(pending, "1/2/3 星合计")
@@ -653,9 +758,11 @@ class App(object):
             return
         st = self.engine.state_for(sid)
         msg = st.get("message") or ""
-        if not st.get("stars_ok", True):
-            msg = (msg + "  ·  " if msg else "") + \
-                  "1/2/3 星数量待确认，请点「刷新数量」重试"
+        if not st.get("stars_ok", False):
+            note = st.get("star_note") or ""
+            msg = ("未读到评价数量（显示 —）：" + note) if note else \
+                  "未读到评价数量（显示 —），点「刷新数量」重试"
+            msg += "  ·  诊断已自动回传"
         extra = ("最近查询 %s" % st["last_check"]) if st.get("last_check") else ""
         self.status_var.set(("  ·  ".join(x for x in (msg, extra) if x))
                             or "准备就绪")
@@ -743,6 +850,23 @@ class App(object):
     def do_refresh(self):
         self._call("refresh")
 
+    def do_star_diag(self):
+        """把真实页面结构自动回传，用户不必再手动找文件、发文件。"""
+        sid = self.selected()
+        if not sid:
+            return
+        self._call("star_diag", sid)
+        messagebox.showinfo(
+            "页面诊断",
+            "正在后台采集当前评价页信息并自动回传（约 6 秒）。\n\n"
+            "回传成功后开发者就能按你后台的真实页面精确适配，\n"
+            "不需要你手动找文件、发文件。\n\n"
+            "本地也会留一份「星级诊断_*.json」，长数字已打码，\n"
+            "不含密码或密钥。",
+            parent=self.root)
+        self.root.after(6000,
+                        lambda p=self.store.shop_dir(sid): self._open(p))
+
     def _license_ok(self):
         """开始举报前复核授权：吊销 / 到期会即时挡住。"""
         if not self.license_session:
@@ -790,20 +914,129 @@ class App(object):
 
     def do_account_info(self):
         if not self.license_session:
-            messagebox.showinfo("账号", "源码运行模式：未启用授权校验。",
-                                parent=self.root)
+            messagebox.showinfo(
+                "账号", "源码运行模式：未启用授权校验。\n\n" +
+                _ver_detail(self._running_ver), parent=self.root)
             return
+        messagebox.showinfo(
+            "账号与授权",
+            self.license_session.detail() +
+            "\n\n离线可用 72 小时，联网后自动续期。\n\n" +
+            _ver_detail(self._running_ver), parent=self.root)
+
+    # ---------- 版本与更新 ----------
+    def do_version_info(self):
+        messagebox.showinfo(
+            "版本信息",
+            _ver_detail(self._running_ver) +
+            "\n\n云端发布新版后，关闭并重新打开软件即自动生效；"
+            "也可以点「检查更新」立即下载。",
+            parent=self.root)
+
+    def do_check_update(self):
+        self._check_update(manual=True)
+
+    def _check_update(self, manual=False):
+        """后台查云端；发现新版直接下载安装，下次启动生效。"""
+        if self._checking_update:
+            if manual:
+                messagebox.showinfo("检查更新", "正在检查中，请稍候…",
+                                    parent=self.root)
+            return
+        self._checking_update = True
+
+        def worker():
+            cur = self._running_ver
+            out = {"cur": cur, "remote": None, "error": "",
+                   "downloaded": 0, "download_err": ""}
+            try:
+                ep = _endpoint()
+                if not ep:
+                    raise RuntimeError("未配置更新服务器地址")
+                out["remote"] = _post_update(
+                    ep, "check_update", {"appVersion": cur["version"]})
+            except Exception as e:
+                out["error"] = str(e)[:140]
+            r = out["remote"] or {}
+            try:
+                remote_ver = int(r.get("version") or 0)
+            except (TypeError, ValueError):
+                remote_ver = 0
+            if r.get("hasUpdate") and remote_ver > cur["version"]:
+                try:
+                    import updater
+                    out["downloaded"] = int(
+                        updater.apply_update(timeout_check=6,
+                                             timeout_get=25) or 0)
+                except Exception as e:
+                    out["download_err"] = str(e)[:140]
+            try:
+                self.root.after(0,
+                                lambda: self._on_update_checked(out, manual))
+            except Exception:
+                self._checking_update = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_checked(self, out, manual):
+        self._checking_update = False
+        cur = out["cur"]
+        r = out["remote"] or {}
         try:
-            import updater
-            v = updater.version_info()
-            ver = ("\n\n客户端版本：%s%s" %
-                   (v["version"], "（云端热更新）" if v["patched"] else "（exe 内置）"))
+            self.version_var.set(_ver_short(cur))
         except Exception:
-            ver = ""
-        messagebox.showinfo("账号与授权",
-                            self.license_session.detail() +
-                            "\n\n离线可用 72 小时，联网后自动续期。" + ver,
-                            parent=self.root)
+            pass
+        label = ((r.get("label") or "").strip() or
+                 ("版本 " + str(r.get("version") or "")))
+        changelog = (r.get("changelog") or "").strip()
+
+        if out["downloaded"] and out["downloaded"] > cur["version"]:
+            messagebox.showinfo(
+                "更新已下载",
+                "已下载新版：%s\n版本号：%s\n\n"
+                "关闭并重新打开软件即可生效。当前窗口继续运行现有版本，"
+                "不影响正在进行的任务。%s"
+                % (label, out["downloaded"],
+                   ("\n\n本次更新：\n" + changelog[:200]) if changelog else ""),
+                parent=self.root)
+            return
+
+        # 用户反馈「关掉重开也没提示」：启动阶段刚装上补丁时主动告知
+        just_applied = bool(cur["patched"] and cur["appliedAt"] and
+                            time.time() - cur["appliedAt"] < 300)
+        if just_applied and not manual and not out["error"]:
+            messagebox.showinfo(
+                "已自动更新",
+                "本次启动已自动加载热更新：\n\n%s\n版本号 %s\n安装时间 %s\n\n"
+                "右下角可随时查看当前版本；点「检查更新」可手动检查。"
+                % (cur["label"] or "最新版", cur["version"],
+                   time.strftime("%Y-%m-%d %H:%M",
+                                 time.localtime(cur["appliedAt"]))),
+                parent=self.root)
+            return
+
+        if not manual:
+            return  # 已是最新，安静不打扰
+
+        if out["error"]:
+            messagebox.showwarning(
+                "检查更新", "检查失败：%s\n\n当前仍是 %s" %
+                (out["error"], _ver_short(cur)), parent=self.root)
+            return
+        if r.get("hasUpdate"):
+            messagebox.showwarning(
+                "检查更新",
+                "发现新版 %s，但下载未完成%s。\n\n"
+                "关闭并重新打开软件会自动重试。" %
+                (label,
+                 "（" + out["download_err"] + "）" if out["download_err"] else ""),
+                parent=self.root)
+            return
+        messagebox.showinfo(
+            "检查更新",
+            "已是最新版本。\n\n" + _ver_detail(cur) +
+            "\n\n云端版本：%s" % (r.get("version") or "未返回"),
+            parent=self.root)
 
     def do_license_check(self):
         if not self.license_session:
@@ -904,7 +1137,12 @@ class App(object):
             "触发风控立即暂停并弹「已到达当日举报上限」，明天自动恢复。\n"
             "5. 左侧是产品功能栏目：DSR 计算器 / 智能直通车 / 利润汇总"
             "目前为待开发占位；左下角可切换浅色 / 深色主题。\n"
-            "6. 每家店铺的登录态、台账、上限标记互相独立，互不影响。\n\n"
+            "6. 每家店铺的登录态、台账、上限标记互相独立，互不影响。\n"
+            "7. 右下角显示当前版本号，点它可看版本详情；「检查更新」会立即查云端，"
+            "每次启动也会自动检查，装好新版会弹窗提示，重启即生效。\n"
+            "8. 1/2/3 星数量按「接口统计 → 星级标签 → 逐页统计评价卡片 → 筛选分页」"
+            "四级读取；读不到时显示「—」（不是 0 条），并可右键「上报页面诊断」，"
+            "程序会自动把真实页面结构回传给开发者，无需你手动传文件。\n\n"
             "数据目录：程序同级的 pdd_data 文件夹（可整包拷贝备份）。",
             parent=self.root)
 

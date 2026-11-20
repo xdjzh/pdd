@@ -267,6 +267,8 @@ class Engine(object):
             elif cmd == "shop_name":
                 await s.run_exclusive(s.refresh_shop_name(overwrite=True),
                                       kind="refresh")
+            elif cmd == "star_diag":
+                await s.run_exclusive(s.export_star_diag(), kind="refresh")
             elif cmd == "start_report":
                 await s.run_exclusive(s.run_report(), kind="report")
             else:
