@@ -1411,11 +1411,43 @@ class ShopSession(object):
         except Exception:
             pass
 
+        # ★ v1.4.1：读数前先清除上一次残留的星级筛选。
+        #   _enter_review_page 若已在评价页会直接返回，不会重载页面，
+        #   上一点亮的星级一直残留 → 反复刷新越叠越多（截图的 434/368/2000）。
+        #   用核心脚本的 _cancel_current_star_filter（点"全部"+取消激活项）归零。
+        if callable(getattr(r, "_cancel_current_star_filter", None)):
+            try:
+                await r._cancel_current_star_filter()
+            except Exception as e:
+                notes_reset = "重置星级失败:%s" % str(e)[:40]
+            else:
+                notes_reset = "已重置星级筛选"
+        else:
+            notes_reset = "无重置接口"
+
+        try:
+            await asyncio.sleep(1.2)
+            all_state = await r._scan_star_filters()
+            still_active = [x["star"] for x in (all_state or []) if x.get("active")]
+        except Exception:
+            still_active = []
+
+        # 星级已归零，此刻分页显示的是"全部评价"基准数，先记下来用于合理性校验。
+        all_total = None
+        try:
+            ps0 = await r._pager_state()
+            if isinstance(ps0, dict):
+                all_total = ps0.get("totalRows")
+        except Exception:
+            pass
+
         # 确认核心脚本具备单选能力（老补丁环境若没有则退回旧路径）
         has_set_only = callable(getattr(r, "_set_only_star", None)) and \
                        callable(getattr(r, "_scan_star_filters", None))
 
         vals, notes = {}, []
+        if notes_reset:
+            notes.append(notes_reset)
         for star in (1, 2, 3):
             if has_set_only:
                 # 用核心脚本的成熟逻辑：点亮目标 + 取消所有残留星级 + 内部3轮复核。
@@ -1477,6 +1509,22 @@ class ShopSession(object):
 
         if not all(isinstance(vals.get(s), int) for s in (1, 2, 3)):
             return None
+
+        # ★ v1.4.1 合理性校验：单星数量必须明显小于"全部评价"基准。
+        #   截图里 3星=2000 恰等于全部评价数（诊断"共有 2000 条"），
+        #   这是星级没筛上、读到全量的典型特征，绝不能采信。
+        if isinstance(all_total, int) and all_total > 0:
+            if any(vals.get(s, 0) >= all_total for s in (1, 2, 3)):
+                notes.append("合理性校验失败：单星读数>=全部评价%d，判定筛选未生效" % all_total)
+                return None
+        # 累加特征：3个数严格递增且最大≈另两个之和（误差10%），判为残留累加。
+        v = [vals[1], vals[2], vals[3]]
+        if v[0] < v[1] < v[2] and v[2] > 0:
+            s12 = v[0] + v[1]
+            if abs(v[2] - s12) <= max(3, s12 * 0.1):
+                notes.append("合理性校验失败：读数 %d/%d/%d 呈累加特征" % tuple(v))
+                return None
+
         return {"counts": {s: vals[s] for s in (1, 2, 3)},
                 "distinct": len(set(vals.values())) > 1, "notes": notes}
 
