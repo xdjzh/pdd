@@ -252,6 +252,100 @@ STAR_CARDS_JS = r"""
 }
 """
 
+# 关闭评价页上的遮挡浮层（「新消息」「评价有礼」等），它们会挡住星级筛选
+# 和分页，导致逐页统计只扫到 1 条、截图也看不清。只点明确的关闭按钮。
+DISMISS_OVERLAY_JS = r"""
+() => {
+  const clean = s => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  let closed = 0;
+  // 1) 消息面板右上角的圆形关闭按钮：常见是 title/aria-label 含「关闭」或
+  //    位于「新消息」浮层内、文本为空的 svg/button。只点可见且无文字的。
+  const panels = [];
+  for (const el of document.querySelectorAll('div,section,aside')) {
+    if (el.offsetParent === null) continue;
+    const t = clean(el.innerText || '');
+    if (/^新消息|消息\s*\(|通知/.test(t) && t.length < 300) panels.push(el);
+  }
+  for (const p of panels) {
+    const btn = p.querySelector('[class*="close"], [class*="Close"], [aria-label*="关闭"], button');
+    if (btn && btn.offsetParent !== null) { try { btn.click(); closed++; } catch (e) {} }
+  }
+  // 2) 通用浮层关闭：带 close 类、无文字、可见的小图标
+  for (const el of document.querySelectorAll('[class*="close"],[class*="Close"],[data-testid*="close"]')) {
+    if (el.offsetParent === null) continue;
+    const t = clean(el.textContent || '');
+    if (t.length > 2) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width > 40 || r.height > 40 || r.width < 8 || r.height < 8) continue;
+    try { el.click(); closed++; } catch (e) {}
+  }
+  return {closed: closed};
+}
+"""
+
+# 星级筛选标签：诊断证实评价管理页有「用户评价得分 1星 2星 3星 4星 5星」，
+# 叶节点文本精确为「N星」，父级 class 含 evaluation_search_*。这里标记它们，
+# 并返回当前分页总数（PGT_totalText「共有 N 条」），供「点星级→读分页」使用。
+STAR_FILTER_READ_JS = r"""
+() => {
+  const clean = s => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const vis = el => { try { return el && el.offsetParent !== null; } catch (e) { return false; } };
+  document.querySelectorAll('[data-pdd-sf]').forEach(e => e.removeAttribute('data-pdd-sf'));
+  const tags = [];
+  const cn = {'一':1,'二':2,'三':3,'四':4,'五':5};
+  for (const el of document.querySelectorAll('span,div,a,button,li,label,em,b,strong')) {
+    if (!vis(el) || el.children.length > 1) continue;
+    const t = clean(el.textContent || '');
+    if (!t || t.length > 6) continue;
+    let s = null;
+    const m = t.match(/^([1-5])星$/);
+    if (m) s = parseInt(m[1], 10);
+    else { const m2 = t.match(/^([一二三四五])星$/); if (m2) s = cn[m2[1]]; }
+    if (!s || s < 1 || s > 5) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 6) continue;
+    // 只要叶子文本恰好是「N星」，基本就是星级筛选（评价卡片里是「给出了N星」）
+    const mark = 's' + s + '_' + tags.length;
+    el.setAttribute('data-pdd-sf', mark);
+    const cls = ((el.className || '') + ' ' +
+                 (el.parentElement ? el.parentElement.className : '')).toString().toLowerCase();
+    const active = /active|selected|checked|current|on\b/.test(cls) ||
+                   el.getAttribute('aria-checked') === 'true' ||
+                   el.getAttribute('aria-selected') === 'true';
+    tags.push({mark: mark, star: s, text: t, active: active,
+               x: Math.round(r.x), y: Math.round(r.y), cls: cls.slice(0, 90)});
+  }
+  // 去重：同一星级只留第一个（最靠上的通常是筛选区）
+  const byStar = {};
+  for (const tag of tags) if (!byStar[tag.star]) byStar[tag.star] = tag;
+  // 分页总数
+  let total = null, totalText = '';
+  for (const ul of document.querySelectorAll('ul[data-testid="beast-core-pagination"],ul[class*="pagination"]')) {
+    const tEl = ul.querySelector('li[class*="PGT_totalText_"]');
+    if (tEl) totalText = clean(tEl.innerText || tEl.textContent);
+    if (!totalText) {
+      for (const li of ul.querySelectorAll('li')) {
+        const t = clean(li.innerText || li.textContent);
+        if (/共有?\s*[0-9]+\s*条/.test(t)) { totalText = t; break; }
+      }
+    }
+    const tm = totalText.match(/([0-9]+)\s*条/);
+    if (tm) { total = parseInt(tm[1], 10); break; }
+  }
+  if (total === null) {
+    const m = (document.body.innerText || '').match(/共(?:查询到|有)?\s*([0-9,]+)\s*条/);
+    if (m) total = parseInt(m[1].replace(/,/g, ''), 10);
+  }
+  // 列表指纹：确认筛选后列表真的变了
+  const host = document.querySelector('[class*="table"],[class*="Table"],tbody') || document.body;
+  const listText = clean((host.innerText || '').slice(0, 1200));
+  let h = 5381;
+  for (let i = 0; i < listText.length; i++) h = ((h << 5) + h + listText.charCodeAt(i)) | 0;
+  return {tags: Object.values(byStar), total: total, totalText: totalText,
+          listSig: (h >>> 0).toString(16)};
+}
+"""
+
 # 页面类型判定：必须区分「评价管理页」和「商品列表页」。
 # 后者也有分页「共有 N 条」，但那是商品数量，被误当成评价数就会出现 7/7/7。
 PAGE_KIND_JS = r"""
@@ -1225,6 +1319,99 @@ class ShopSession(object):
                  "未读到可信的评价数量，诊断已本地留档并自动回传；可点「刷新数量」重试")
         self.engine.publish(self)
 
+    async def _dismiss_overlays(self):
+        """关掉评价页的「新消息」等浮层，避免挡住星级筛选和分页。"""
+        if not self.page:
+            return 0
+        try:
+            r = await self.page.evaluate(DISMISS_OVERLAY_JS)
+            return int((r or {}).get("closed", 0) or 0)
+        except Exception:
+            return 0
+
+    async def count_stars_by_filter(self):
+        """星级筛选→分页总数：诊断证实评价页有真实星级筛选与分页，这是最可靠的来源。
+
+        页面结构（v1.3.7 诊断确认）：
+          - 「用户评价得分 1星 2星 3星 4星 5星」叶节点文本精确为「N星」
+          - 分页 li[class*="PGT_totalText_]：共查询到 N 条 / 共有 N 条
+        逐个点亮 1/2/3 星，等接口刷新列表后读分页总数；列表指纹必须变化，
+        否则说明筛选没生效（多选叠加或没点上），不采信。返回 None 表示该路不通。
+        """
+        if not self.page or not self.reporter:
+            return None
+        r = self.reporter
+        await self._dismiss_overlays()
+        try:
+            await self.page.evaluate("window.scrollTo(0, 0)")
+        except Exception:
+            pass
+
+        first = await self.page.evaluate(STAR_FILTER_READ_JS)
+        tags = (first or {}).get("tags") or []
+        if not any(t.get("star") in (1, 2, 3) for t in tags):
+            return None
+
+        vals, notes = {}, []
+        base_sig = (first or {}).get("listSig")
+        for star in (1, 2, 3):
+            tag = next((t for t in tags if t.get("star") == star), None)
+            if not tag:
+                notes.append("%s星无筛选按钮" % star)
+                vals[star] = None
+                continue
+            try:
+                loc = self.page.locator('[data-pdd-sf="%s"]' % tag["mark"]).first
+                await loc.scroll_into_view_if_needed()
+                await loc.click(timeout=4000)
+            except Exception:
+                try:
+                    await self.page.evaluate(
+                        "(m)=>{const e=document.querySelector('[data-pdd-sf=\\\"%s\\\"]');"
+                        "if(e)e.click();}" % tag["mark"])
+                except Exception:
+                    notes.append("%s星点击失败" % star)
+                    vals[star] = None
+                    continue
+            # 等接口刷新：轮询分页/列表，最多 ~4.5s，取稳定后的读数
+            n = None
+            sig_changed = False
+            last = None
+            for _ in range(9):
+                await asyncio.sleep(0.5)
+                try:
+                    cur = await self.page.evaluate(STAR_FILTER_READ_JS)
+                except Exception:
+                    continue
+                cn = cur.get("total")
+                if cn is not None:
+                    n = cn
+                if base_sig and cur.get("listSig") and cur["listSig"] != base_sig:
+                    sig_changed = True
+                if last is not None and cn == last and cn is not None:
+                    break
+                last = cn
+            # 用核心脚本的分页状态再确认一次（更精确）
+            try:
+                ps = await r._pager_state()
+                if isinstance(ps.get("totalRows"), int) and ps["totalRows"] >= 0:
+                    n = ps["totalRows"]
+            except Exception:
+                pass
+            vals[star] = n
+            notes.append("%s星=%s%s" % (star, n, "✓" if sig_changed else "(列表未变)"))
+
+        have = [v for v in vals.values() if isinstance(v, int)]
+        if not have:
+            return None
+        # 三个数都在、且至少两个不同 → 认为筛选生效；全相同但列表变化过也可信。
+        complete = all(isinstance(vals.get(s), int) for s in (1, 2, 3))
+        distinct = len(set(have)) > 1
+        if not complete:
+            return None
+        return {"counts": {s: vals[s] for s in (1, 2, 3)},
+                "distinct": distinct, "notes": notes}
+
     async def count_stars_by_cards(self, max_pages=12, max_seconds=55):
         """逐页统计评价卡片的星级，完全不依赖星级筛选控件。
 
@@ -1548,7 +1735,23 @@ class ShopSession(object):
             self._apply_stars(tabs, "tab", True, "来自页面星级标签")
             return
 
-        # 3) 逐页统计评价卡片：星级筛选控件认不出来也能拿到数字
+        # 3) 星级筛选→分页总数（v1.3.8 新增，最可靠）
+        #    v1.3.7 诊断证实：页面有真实星级筛选按钮 + 分页读数；之前是被
+        #    「逐页统计残缺数据」抢先 return 了，才一直显示 0/0/0。
+        try:
+            await self._dismiss_overlays()
+            filt = await self.count_stars_by_filter()
+        except Exception as e:
+            filt = None
+            self.set(message="星级筛选统计异常：%s" % str(e)[:60])
+        if filt and filt.get("counts") and (filt.get("distinct") or any(
+                filt["counts"].get(s, 0) > 0 for s in (1, 2, 3))):
+            note = "星级筛选分页：" + "，".join(filt.get("notes") or [])
+            self._apply_stars(filt["counts"], "pager", True, note)
+            return
+
+        # 4) 逐页统计评价卡片：星级筛选控件认不出来也能拿到数字。
+        #    必须覆盖足够比例才采信，否则「只扫到 1 条」会误报 0/0/0。
         try:
             card = await self.count_stars_by_cards()
         except Exception as e:
@@ -1556,18 +1759,25 @@ class ShopSession(object):
             self.set(message="逐页统计异常：%s" % str(e)[:60])
         if card and card.get("scanned", 0) > 0:
             cov = card.get("coverage")
-            note = "逐页统计 %d 条评价（%d 页）" % (card["scanned"], card["pages"])
-            if isinstance(cov, float) and cov < 0.8:
-                note += "，约覆盖 %d%%（分页共 %s 条）" % (
-                    int(cov * 100), card.get("totalRows"))
-            if card.get("samples"):
-                note += "；样例：" + "，".join(
-                    "%s星" % s.get("star") for s in card["samples"][:3])
-            self._apply_stars(card["counts"], "cards", True, note)
-            return
+            enough = (isinstance(cov, float) and cov >= 0.6) or \
+                     (card.get("totalRows") in (None, 0) and card.get("scanned", 0) >= 10)
+            if enough:
+                note = "逐页统计 %d 条评价（%d 页）" % (card["scanned"], card["pages"])
+                if isinstance(cov, float) and cov < 0.8:
+                    note += "，约覆盖 %d%%（分页共 %s 条）" % (
+                        int(cov * 100), card.get("totalRows"))
+                if card.get("samples"):
+                    note += "；样例：" + "，".join(
+                        "%s星" % s.get("star") for s in card["samples"][:3])
+                self._apply_stars(card["counts"], "cards", True, note)
+                return
+            # 覆盖不足：留档但不采信，继续尝试下一路
+            card_note = "逐页统计仅 %d 条/共 %s 条，覆盖不足不采信" % (
+                card.get("scanned"), card.get("totalRows"))
+        else:
+            card_note = ""
 
-        # 4) 逐个筛选 + 分页总数。筛选状态未确认不再一票否决，
-        #    改看「列表指纹是否真的变了」，避免把能读到的数据也否掉。
+        # 5) 逐个筛选 + 分页总数（核心脚本的路径，最后兜底）
         vals, notes, missing = {}, [], 0
         changed_any = False
         for star in (1, 2, 3):
