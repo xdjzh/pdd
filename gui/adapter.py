@@ -1393,11 +1393,14 @@ class ShopSession(object):
     async def count_stars_by_filter(self):
         """星级筛选→分页总数：诊断证实评价页有真实星级筛选与分页，这是最可靠的来源。
 
-        页面结构（v1.3.7 诊断确认）：
-          - 「用户评价得分 1星 2星 3星 4星 5星」叶节点文本精确为「N星」
-          - 分页 li[class*="PGT_totalText_]：共查询到 N 条 / 共有 N 条
-        逐个点亮 1/2/3 星，等接口刷新列表后读分页总数；列表指纹必须变化，
-        否则说明筛选没生效（多选叠加或没点上），不采信。返回 None 表示该路不通。
+        ★ v1.4.0 关键修复（累加虚高）：
+          拼多多「用户评价得分」的 1/2/3 星是【多选标签】——点 2 星不会自动取消 1 星。
+          旧实现逐个 loc.click() 点亮，导致读数变成逐级累加：
+              点1星→73(真值)，点2星→139(1星+2星)，点3星→507(1+2+3星合计)
+          于是 3 星被虚报成 507（正好等于后台总数），合计 719 > 实际 507。
+          修复：改用核心脚本成熟的 _set_only_star(star)（点亮目标 + 取消所有残留
+          + 复核"仅目标选中"），并在每颗星读数前后用 _scan_star_filters() 独立复核，
+          只有确认"当前恰好只有目标星级选中"才采信分页数。
         """
         if not self.page or not self.reporter:
             return None
@@ -1408,70 +1411,74 @@ class ShopSession(object):
         except Exception:
             pass
 
-        first = await self.page.evaluate(STAR_FILTER_READ_JS)
-        tags = (first or {}).get("tags") or []
-        if not any(t.get("star") in (1, 2, 3) for t in tags):
-            return None
+        # 确认核心脚本具备单选能力（老补丁环境若没有则退回旧路径）
+        has_set_only = callable(getattr(r, "_set_only_star", None)) and \
+                       callable(getattr(r, "_scan_star_filters", None))
 
         vals, notes = {}, []
-        base_sig = (first or {}).get("listSig")
         for star in (1, 2, 3):
-            tag = next((t for t in tags if t.get("star") == star), None)
-            if not tag:
-                notes.append("%s星无筛选按钮" % star)
+            if has_set_only:
+                # 用核心脚本的成熟逻辑：点亮目标 + 取消所有残留星级 + 内部3轮复核。
+                # 举报主流程一直用它且能正常翻页举报，说明它在本页面有效。
+                verified = False
+                try:
+                    await r._set_only_star(star)
+                    verified = bool(getattr(r, "_star_filter_verified", False))
+                except Exception as e:
+                    notes.append("%s星单选异常:%s" % (star, str(e)[:40]))
+                # 外部二次扫描：明确发现"仅目标亮着"也可作为采信依据（双路径，
+                # 避免内部 verified 因时序偶发 False 就把能读的数据否掉）。
+                active_stars = None
+                try:
+                    state = await r._scan_star_filters()
+                    active_stars = [x["star"] for x in (state or []) if x.get("active")]
+                except Exception:
+                    pass
+                only_target = verified or (active_stars == [star])
+            else:
+                notes.append("%s星:核心脚本无单选接口，跳过避免累加" % star)
+                active_stars = None
+                only_target = False
+
+            if not only_target:
+                # 无法确认"仅目标选中"，绝不能读——否则又把累加值当单星数
+                notes.append("%s星未确认单选(亮:%s,已验证:%s)" % (
+                    star, active_stars, verified if has_set_only else "?"))
                 vals[star] = None
                 continue
-            try:
-                loc = self.page.locator('[data-pdd-sf="%s"]' % tag["mark"]).first
-                await loc.scroll_into_view_if_needed()
-                await loc.click(timeout=4000)
-            except Exception:
-                try:
-                    await self.page.evaluate(
-                        "(m)=>{const e=document.querySelector('[data-pdd-sf=\\\"%s\\\"]');"
-                        "if(e)e.click();}" % tag["mark"])
-                except Exception:
-                    notes.append("%s星点击失败" % star)
-                    vals[star] = None
-                    continue
-            # 等接口刷新：轮询分页/列表，最多 ~4.5s，取稳定后的读数
+
+            # 确认单选后，等接口刷新列表，轮询分页到稳定（最多 ~4.5s）。
+            # 优先分页组件 PGT_totalText 的筛选后条数；读不到则用页面正文
+            # 「共查询到 N 条数据」兜底（STAR_FILTER_READ_JS 有该正则）。
             n = None
-            sig_changed = False
             last = None
             for _ in range(9):
                 await asyncio.sleep(0.5)
+                cn = None
                 try:
-                    cur = await self.page.evaluate(STAR_FILTER_READ_JS)
+                    ps = await r._pager_state()
+                    if isinstance(ps, dict):
+                        cn = ps.get("totalRows")
                 except Exception:
-                    continue
-                cn = cur.get("total")
+                    pass
+                if cn is None:
+                    try:
+                        cur = await self.page.evaluate(STAR_FILTER_READ_JS)
+                        cn = cur.get("total") if isinstance(cur, dict) else None
+                    except Exception:
+                        pass
                 if cn is not None:
                     n = cn
-                if base_sig and cur.get("listSig") and cur["listSig"] != base_sig:
-                    sig_changed = True
                 if last is not None and cn == last and cn is not None:
                     break
                 last = cn
-            # 用核心脚本的分页状态再确认一次（更精确）
-            try:
-                ps = await r._pager_state()
-                if isinstance(ps.get("totalRows"), int) and ps["totalRows"] >= 0:
-                    n = ps["totalRows"]
-            except Exception:
-                pass
             vals[star] = n
-            notes.append("%s星=%s%s" % (star, n, "✓" if sig_changed else "(列表未变)"))
+            notes.append("%s星=%s✓单选" % (star, n))
 
-        have = [v for v in vals.values() if isinstance(v, int)]
-        if not have:
-            return None
-        # 三个数都在、且至少两个不同 → 认为筛选生效；全相同但列表变化过也可信。
-        complete = all(isinstance(vals.get(s), int) for s in (1, 2, 3))
-        distinct = len(set(have)) > 1
-        if not complete:
+        if not all(isinstance(vals.get(s), int) for s in (1, 2, 3)):
             return None
         return {"counts": {s: vals[s] for s in (1, 2, 3)},
-                "distinct": distinct, "notes": notes}
+                "distinct": len(set(vals.values())) > 1, "notes": notes}
 
     async def count_stars_by_cards(self, max_pages=12, max_seconds=55):
         """逐页统计评价卡片的星级，完全不依赖星级筛选控件。
