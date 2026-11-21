@@ -758,7 +758,9 @@ class ShopSession(object):
         self.cancel_login = False
         self.stop_report = False
         self.online = False
-        self.stars = {1: 0, 2: 0, 3: 0}
+        self.stars = {1: 0, 2: 0, 3: 0}       # 未举报数（已扣除台账里的已举报）
+        self.stars_total = {1: 0, 2: 0, 3: 0}  # 平台原始全量数（诊断用）
+        self.stars_reported = {1: 0, 2: 0, 3: 0}  # 本次扣除的已举报数
         self.stars_ok = False   # False = 数量未确认，界面显示「—」而不是假数字
         self.stars_source = ""  # api / tab / pager / none，便于排查
         self.star_note = ""
@@ -798,6 +800,8 @@ class ShopSession(object):
             "star1": self.stars.get(1, 0),
             "star2": self.stars.get(2, 0),
             "star3": self.stars.get(3, 0),
+            "stars_total": dict(self.stars_total),
+            "stars_reported": dict(self.stars_reported),
             "stars_ok": bool(self.stars_ok),
             "stars_source": self.stars_source,
             "star_note": self.star_note,
@@ -1303,20 +1307,77 @@ class ShopSession(object):
             out.extend(h.get("totals") or [])
         return out
 
+    def _reported_count_by_star(self):
+        """按本店铺台账统计各星级「已举报」数量（举报中 + 举报成功 + 待核对）。
+
+        权威集合是 reported_ids.json：核心脚本只要点了提交就写入 key，
+        只有被平台明确拒绝（error_toast / 风控）才不写——正好对应界面要排除的部分。
+        report_log.jsonl 每条带 star + key，用于把无星级的台账 key 映射到星级
+        （同一条评价星级固定，取最后一条有效记录即可）。
+
+        映射不到的 key 不计入（宁可少扣、不可多扣），避免显示负数或误删未举报。
+        """
+        result = {1: 0, 2: 0, 3: 0}
+        try:
+            shop_dir = self.store.shop_dir(self.id)
+            ledger = os.path.join(shop_dir, "reported_ids.json")
+            logf = os.path.join(shop_dir, "report_log.jsonl")
+            if not os.path.isfile(ledger):
+                return result
+            with open(ledger, "r", encoding="utf-8") as f:
+                keys = set(str(x) for x in (json.load(f) or []))
+            if not keys:
+                return result
+            key_star = {}
+            if os.path.isfile(logf):
+                with open(logf, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        k, s = rec.get("key"), rec.get("star")
+                        if k in keys and s in (1, 2, 3):
+                            key_star[k] = int(s)
+            for k in keys:
+                s = key_star.get(k)
+                if s in (1, 2, 3):
+                    result[s] += 1
+        except Exception:
+            pass
+        return result
+
     def _apply_stars(self, values, source, ok, note=""):
         # 不可靠时连内部值也清零，避免顶部统计卡把假数字加总（7+7+7=21）
-        if not ok:
-            values = {1: 0, 2: 0, 3: 0}
+        raw = {k: max(0, int(values.get(k, 0) or 0)) for k in (1, 2, 3)} if ok \
+              else {1: 0, 2: 0, 3: 0}
+        # 平台返回的是全量评价数（含举报中/举报成功），界面只显示未举报的：
+        # 统一在这里按台账扣除，顶部「待处理差评」合计与列表 1/2/3 星都会跟着变。
+        rep = self._reported_count_by_star() if ok else {1: 0, 2: 0, 3: 0}
+        self.stars_total = dict(raw)     # 平台原始总数，仅诊断/说明用
+        self.stars_reported = dict(rep)  # 本次已扣除的已举报数
         for k in (1, 2, 3):
-            self.stars[k] = max(0, int(values.get(k, 0) or 0))
+            self.stars[k] = max(0, raw[k] - rep.get(k, 0))
         self.stars_ok = bool(ok)
         self.stars_source = source if ok else "none"
+        rep_total = sum(rep.values())
+        if ok and rep_total:
+            note = "%s；平台共%d条，已扣除已举报%d条（举报中/举报成功）" % (
+                note, sum(raw.values()), rep_total)
         self.star_note = str(note)[:220]
         self.last_check = time.strftime("%H:%M:%S")
         label = {"api": "评价接口", "tab": "星级标签",
                  "cards": "逐页统计评价卡片", "pager": "筛选分页"}.get(source, source)
-        self.set(message=("1/2/3 星数量已更新（来源：%s）" % label) if ok else
-                 "未读到可信的评价数量，诊断已本地留档并自动回传；可点「刷新数量」重试")
+        if ok:
+            msg = "未举报 1/2/3 星已更新（来源：%s）" % label
+            if rep_total:
+                msg += "，已扣除已举报 %d 条" % rep_total
+        else:
+            msg = "未读到可信的评价数量，诊断已本地留档并自动回传；可点「刷新数量」重试"
+        self.set(message=msg)
         self.engine.publish(self)
 
     async def _dismiss_overlays(self):
