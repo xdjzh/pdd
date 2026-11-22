@@ -31,11 +31,12 @@ from .theme import (PALETTES, Chip, PillButton, StatCard, draw_icon,
 
 
 COLUMNS = (
-    ("name", "店铺名称", 210),
-    ("online", "在线状态", 170),
-    ("star1", "1星", 72),
-    ("star2", "2星", 72),
-    ("star3", "3星", 72),
+    ("sel", "选", 44),
+    ("name", "店铺名称", 200),
+    ("online", "在线状态", 160),
+    ("star1", "1星", 68),
+    ("star2", "2星", 68),
+    ("star3", "3星", 68),
     ("reported", "本次举报", 90),
 )
 
@@ -173,6 +174,7 @@ class App(object):
         self._nav_hover = None
         self._closing = False
         self._tick_started = False
+        self.picked = set()          # 表格里勾选的店铺 id（批量举报用）
         # 启动那一刻真正跑起来的版本（下载完补丁后也不会误显示成新版）
         self._running_ver = _ver_state()
         self._checking_update = False
@@ -516,7 +518,11 @@ class App(object):
         self.tree = ttk.Treeview(tf, columns=cols, show="headings",
                                  selectmode="browse", style="Shop.Treeview")
         for key, title, width in COLUMNS:
-            self.tree.heading(key, text=title)
+            if key == "sel":
+                # 点表头「选」= 全选 / 全不选
+                self.tree.heading(key, text=title, command=self.toggle_pick_all)
+            else:
+                self.tree.heading(key, text=title)
             anchor = tk.CENTER if key not in ("name", "online") else tk.W
             self.tree.column(key, width=width, anchor=anchor,
                              stretch=(key == "name"))
@@ -532,6 +538,10 @@ class App(object):
         self.tree.tag_configure("offline", foreground=t["danger"])
         self.tree.tag_configure("idle", foreground=t["muted"])
         self.tree.tag_configure("stripe", background=t["row_alt"])
+        # 勾选行用主题色底 + 主题色字，和普通行区分开（用户反馈「选择不明显」）
+        self.tree.tag_configure("picked", background=t["accent_soft"],
+                               foreground=t["accent"])
+        self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Double-1>", lambda e: self.do_login())
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_detail())
         self.tree.bind("<Button-3>", self._popup_menu)
@@ -713,8 +723,8 @@ class App(object):
                 self._last_license_check = time.time()
                 self._async_license_check()
             for ev in self.engine.pop_events():
-                if ev[0] == "auto_task":
-                    # 自动任务进度/结果只写状态栏，不弹窗打扰
+                if ev[0] in ("auto_task", "multi_report"):
+                    # 自动任务 / 批量举报的进度与结果只写状态栏，不弹窗打扰
                     try:
                         self.status_var.set(ev[1])
                     except Exception:
@@ -739,13 +749,17 @@ class App(object):
         wanted = set(states.keys())
         for sid in existing - wanted:
             self.tree.delete(sid)
+        # 被删掉的店铺从勾选集里清掉，避免拿旧 id 去举报
+        if self.picked - wanted:
+            self.picked &= wanted
         for sid, st in states.items():
             dot = "●  " if st.get("online") else "○  "
             stars = [st.get("star1", 0), st.get("star2", 0), st.get("star3", 0)]
             # 没拿到可信读数就显示「—」；旧版会把同一个旧分页值填进三列（7/7/7）
             if not st.get("stars_ok", False):
                 stars = ["—", "—", "—"]
-            values = (st["name"], dot + str(st["status"]),
+            mark = "☑" if sid in self.picked else "☐"
+            values = (mark, st["name"], dot + str(st["status"]),
                       stars[0], stars[1], stars[2], st["reported"])
             if sid in existing:
                 self.tree.item(sid, values=values)
@@ -755,9 +769,12 @@ class App(object):
             st = states.get(sid)
             if not st:
                 continue
-            tags = [self._tag(st)]
-            if i % 2:
-                tags.append("stripe")
+            if sid in self.picked:
+                tags = ["picked"]          # 勾选行只上 picked，保证底色/字色压过状态色
+            else:
+                tags = [self._tag(st)]
+                if i % 2:
+                    tags.append("stripe")
             self.tree.item(sid, tags=tuple(tags))
 
         online = sum(1 for st in states.values() if st.get("online"))
@@ -770,8 +787,53 @@ class App(object):
         self.stat_online.set_value(online, "当前保持在线")
         self.stat_pending.set_value(pending, "1/2/3 星合计")
         self.stat_reported.set_value(reported, "本次会话累计")
-        self.count_var.set("共 %d 家店铺" % len(states))
+        self._update_pick_hint()
         self._show_detail()
+
+    # ---------- 勾选（批量举报） ----------
+    def _update_pick_hint(self):
+        """店铺列表右上角实时显示「共几家 / 已勾选几家」，让选择看得见。"""
+        try:
+            total = len(self.tree.get_children())
+            n = len(self.picked)
+            if n:
+                self.count_var.set("共 %d 家店铺 · 已勾选 %d 家" % (total, n))
+            else:
+                self.count_var.set("共 %d 家店铺 · 点左侧方框可多选" % total)
+        except Exception:
+            pass
+
+    def _toggle_pick(self, sid):
+        if not sid:
+            return
+        if sid in self.picked:
+            self.picked.discard(sid)
+        else:
+            self.picked.add(sid)
+        self._render()
+
+    def toggle_pick_all(self):
+        """点表头「选」：全部勾选 / 全部取消。"""
+        ids = list(self.tree.get_children())
+        if ids and all(i in self.picked for i in ids):
+            self.picked.clear()
+            self.status_var.set("已取消全部勾选")
+        else:
+            self.picked.update(ids)
+            self.status_var.set("已勾选全部 %d 家店铺，点「开始举报」批量执行" % len(ids))
+        self._render()
+
+    def _on_tree_click(self, event):
+        """点第一列的方框勾选/取消；点其它列仍按普通选中处理。"""
+        try:
+            if self.tree.identify_region(event.x, event.y) != "cell":
+                return None
+            if self.tree.identify_column(event.x) != "#1":
+                return None
+            self._toggle_pick(self.tree.identify_row(event.y))
+            return "break"
+        except Exception:
+            return None
 
     @staticmethod
     def _as_int(value):
@@ -850,9 +912,11 @@ class App(object):
             messagebox.showwarning("无法添加", str(e), parent=self.root)
             return
         # 添加后立即进入扫码，不需要再点一次「扫码登录」
-        self.engine.add_shop(shop, then="login")
+        # new_shop=True：扫码成功后若自动任务开着，引擎会立刻给这家补跑一次举报
+        self.engine.add_shop(shop, then="login", new_shop=True)
         self.status_var.set(
-            "已打开扫码登录窗口（默认二维码）· 扫码成功后自动获取店铺名并隐藏浏览器")
+            "已打开扫码登录窗口（默认二维码）· 扫码成功后自动获取店铺名并隐藏浏览器"
+            + ("· 自动任务已开，登录成功后将自动补跑举报" if self.settings.get("auto_task") else ""))
 
     def do_rename(self):
         sid = self.selected()
@@ -891,6 +955,7 @@ class App(object):
             return
         self.engine.remove_shop(sid)
         self.store.remove(sid)
+        self.picked.discard(sid)
 
     def do_login(self):
         if self._call("login"):
@@ -1119,6 +1184,28 @@ class App(object):
     def do_start(self):
         if not self._license_ok():
             return
+        # 1) 有勾选 → 批量串行举报（一家跑完再跑下一家，避免同时打接口被风控）
+        #    按表格里的顺序跑，和用户看到的排序一致
+        order = list(self.tree.get_children())
+        ids = [sid for sid in order if sid in self.picked
+               and self.engine.state_for(sid).get("online")]
+        if ids:
+            offline = len(self.picked) - len(ids)
+            limited = [self.engine.state_for(sid)["name"] for sid in ids
+                       if self.engine.state_for(sid).get("daily_limit")]
+            msg = ("将依次举报已勾选的 %d 家店铺（串行执行，一家跑完再跑下一家）。"
+                   % len(ids))
+            if offline:
+                msg += "\n\n另有 %d 家未登录，已跳过。" % offline
+            if limited:
+                msg += "\n\n其中 %d 家今天已触发风控，会自动跳过：\n%s" % (
+                    len(limited), "、".join(limited[:5]))
+            if not messagebox.askokcancel("批量举报", msg, parent=self.root):
+                return
+            self.engine.report_many(ids)
+            self.status_var.set("已开始批量举报 %d 家店铺…" % len(ids))
+            return
+        # 2) 没勾选 → 保持原来的单选行为
         if self.selected():
             st = self.engine.state_for(self.selected())
             if st.get("daily_limit") and not messagebox.askyesno(
@@ -1130,11 +1217,13 @@ class App(object):
     def do_start_all(self):
         if not self._license_ok():
             return
-        for sid in self.engine.snapshot():
-            st = self.engine.state_for(sid)
-            if not st.get("online") or st.get("daily_limit"):
-                continue
-            self.engine.call("start_report", sid)
+        ids = [sid for sid, st in self.engine.snapshot().items()
+               if st.get("online") and not st.get("daily_limit")]
+        if not ids:
+            self.status_var.set("没有可举报的在线店铺（未登录或已到上限）")
+            return
+        self.engine.report_many(ids)
+        self.status_var.set("已开始全部举报：%d 家店铺（串行执行）…" % len(ids))
 
     # ---------- 自动任务 / 开机自启 ----------
     def _refresh_auto_task_ui(self):
@@ -1205,7 +1294,8 @@ class App(object):
             "工作方式：\n"
             "  1. 开启后，每天开机软件会自动登录所有已保存登录态的店铺；\n"
             "  2. 逐个自动举报 1/2/3 星差评，直到该店当日上限；\n"
-            "  3. 同一天只跑一次，不会重复消耗举报额度；\n"
+            "  3. 按「每家店铺 / 每天一次」去重，不会重复消耗举报额度；\n"
+            "     当天新增的店铺登录成功后会自动补跑一次，不用等到明天；\n"
             "  4. 想停掉：点标题区「自动任务」按钮，或菜单里取消勾选，"
             "随时生效、无需重启。" % (on, boot, adate, last),
             parent=self.root)
@@ -1259,6 +1349,8 @@ class App(object):
             "3. 表格自动查 1/2/3 星评价数量，并定时续期登录态（每 2 分钟）。\n"
             "4. 点「开始举报」只走「同行恶意差评」单入口；"
             "触发风控立即暂停并弹「已到达当日举报上限」，明天自动恢复。\n"
+            "   店铺列表左侧方框可以多选（点表头「选」= 全选），"
+            "勾选后点「开始举报」会按顺序一家家跑完。\n"
             "5. 左侧是产品功能栏目：DSR 计算器 / 智能直通车 / 利润汇总"
             "目前为待开发占位；左下角可切换浅色 / 深色主题。\n"
             "6. 每家店铺的登录态、台账、上限标记互相独立，互不影响。\n"
@@ -1268,7 +1360,9 @@ class App(object):
             "四级读取；读不到时显示「—」（不是 0 条），并可右键「上报页面诊断」，"
             "程序会自动把真实页面结构回传给开发者，无需你手动传文件。\n"
             "9. 点窗口右上角 X 只是最小化到任务栏，程序继续在后台续期登录、"
-            "跑自动任务；要彻底关闭，请点状态栏或菜单栏的「退出程序」。\n\n"
+            "跑自动任务；要彻底关闭，请点状态栏或菜单栏的「退出程序」。\n"
+            "10. 自动任务按「每家店铺 / 每天一次」记录：当天新增的店铺，"
+            "扫码登录成功后会自动补跑一次举报，不会因为「今天已经跑过」等到明天。\n\n"
             "数据目录：程序同级的 pdd_data 文件夹（可整包拷贝备份）。",
             parent=self.root)
 

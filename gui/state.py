@@ -176,6 +176,8 @@ DEFAULT_SETTINGS = {
     "auto_startup": False,     # 开机自启（注册表 Run 项）
     "auto_date": "",           # 最近一次自动任务执行日期 YYYY-MM-DD（当天不重复）
     "auto_result": "",         # 最近一次自动任务结果摘要（界面展示用）
+    "auto_shop_date": {},      # {shop_id: YYYY-MM-DD} 每家店最近一次自动举报日期
+                               # （新增店铺当天补跑也算，避免「一天只跑一次」漏店）
     "close_tip_shown": False,  # 是否已提示过「点 X 只是最小化到任务栏」
 }
 

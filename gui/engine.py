@@ -106,7 +106,8 @@ class Engine(object):
 
         规则：
           - 仅当 settings.auto_task 开启时执行（用户随时可关 = 手动取消）；
-          - 同一天只执行一次（auto_date 去重），跨天自动允许；
+          - **按店铺去重**（auto_shop_date[shop_id] = 日期）：某店今天跑过就跳过。
+            这样「今天已经自动跑过一轮」不会把白天新增的店铺挡到明天；
           - 逐个店铺串行：跳过未登录、已到上限的；每跑完一个再跑下一个；
           - 全程可随时被用户点「停止」或被关掉开关打断。
         """
@@ -118,25 +119,30 @@ class Engine(object):
         if self._closed or not st.get("auto_task"):
             return
         today = time.strftime("%Y-%m-%d")
-        if st.get("auto_date") == today:
-            self.emit("auto_task", "今日已执行过自动任务，跳过")
-            return
+        done = dict(st.get("auto_shop_date") or {})
         sessions = [s for s in list(self.sessions.values())
                     if s.store.has_login(s.id)]
         if not sessions:
             self.emit("auto_task", "自动任务：没有已登录店铺，等待下次开机")
             st.update(auto_result="无已登录店铺")
             return
+        todo = [s for s in sessions if done.get(s.id) != today]
+        if not todo:
+            self.emit("auto_task", "今日各店铺都已执行过自动任务，跳过")
+            st.update(auto_date=today, auto_result="今日各店铺已完成")
+            return
         total = 0
         ran = 0
-        for s in sessions:
+        for s in todo:
             if self._closed or not st.get("auto_task"):
                 break
             # 用户中途把开关关了 = 手动取消，立即停
             if not s.store.has_login(s.id):
                 continue
             if s.core.daily_limit_state():
-                continue  # 今天已到上限
+                done[s.id] = today        # 已到上限也算今天处理过
+                st.set("auto_shop_date", done)
+                continue
             if s.busy():
                 continue  # 用户正在手动操作这家，跳过不打断
             try:
@@ -144,6 +150,8 @@ class Engine(object):
                 await s.run_exclusive(s.run_report(), kind="report")
                 total += int(getattr(s, "reported", 0) or 0)
                 ran += 1
+                done[s.id] = today
+                st.set("auto_shop_date", done)
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
                 break
@@ -154,6 +162,79 @@ class Engine(object):
         if st.get("auto_task"):
             st.update(auto_date=today, auto_result=result)
         self.emit("auto_task", result)
+
+    async def _auto_report_shop(self, s, why="新增店铺"):
+        """单店「当天补跑」：只在这一家店铺刚登录成功时触发。
+
+        这是「一天只跑一次」的补丁：用户白天新增店铺时，全局自动任务今天已经跑过，
+        新店会被 auto_date 挡到明天、白漏一整天。改成按店铺记录后，新店登录成功
+        立刻补跑一次，已跑过/已到上限的直接跳过。
+        """
+        st = self.settings
+        if not st or self._closed or not st.get("auto_task"):
+            return
+        today = time.strftime("%Y-%m-%d")
+        done = dict(st.get("auto_shop_date") or {})
+        if done.get(s.id) == today:
+            return
+        if s.core.daily_limit_state():
+            done[s.id] = today
+            st.set("auto_shop_date", done)
+            self.emit("auto_task", "新增店铺今天已达上限，跳过：%s" % s.name)
+            return
+        if s.busy():
+            return
+        self.emit("auto_task", "%s自动举报：%s" % (why, s.name))
+        try:
+            await s.run_exclusive(s.run_report(), kind="report")
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            traceback.print_exc()
+            return
+        done = dict(st.get("auto_shop_date") or {})
+        done[s.id] = today
+        st.set("auto_shop_date", done)
+        self.emit("auto_task", "%s自动举报完成：%s，本次 %d 条" % (
+            why, s.name, int(getattr(s, "reported", 0) or 0)))
+
+    # ---------- 多选批量举报 ----------
+    def report_many(self, shop_ids):
+        """GUI 线程调用：按顺序串行举报勾选的多家店铺。
+
+        串行是故意的：多个店铺同时打接口最容易触发风控，一家跑完再跑下一家。
+        """
+        ids = [i for i in (shop_ids or []) if i]
+        if not ids:
+            return
+
+        def _do():
+            asyncio.ensure_future(self._report_many(ids))
+        self._post(_do)
+
+    async def _report_many(self, ids):
+        for sid in ids:
+            if self._closed:
+                break
+            s = self.sessions.get(sid)
+            if not s or not s.store.has_login(sid):
+                self.emit("multi_report", "跳过未登录店铺")
+                continue
+            if s.busy():
+                self.emit("multi_report", "跳过 %s：正在执行其他任务" % s.name)
+                continue
+            if s.core.daily_limit_state():
+                self.emit("multi_report", "跳过 %s：今日已达上限" % s.name)
+                continue
+            try:
+                self.emit("multi_report", "开始举报：%s" % s.name)
+                await s.run_exclusive(s.run_report(), kind="report")
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                traceback.print_exc()
+            await asyncio.sleep(1)
+        self.emit("multi_report", "勾选店铺已处理完")
 
     async def _cleanup(self):
         for s in list(self.sessions.values()):
@@ -320,6 +401,15 @@ class Engine(object):
             if cmd == "login":
                 await s.run_exclusive(s.login(timeout=kw.get("timeout", 300)),
                                       kind="login")
+                # 新增店铺扫码成功后：若自动任务开着，立刻给这家补跑一次
+                # （否则「一天只跑一次」会让新店白漏一天）
+                if kw.get("new_shop") and s.store.has_login(s.id):
+                    try:
+                        await self._auto_report_shop(s, why="新增店铺")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        traceback.print_exc()
             elif cmd == "refresh":
                 await s.run_exclusive(s.heartbeat(), kind="heartbeat")
                 if not s.busy():
