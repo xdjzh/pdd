@@ -1718,6 +1718,11 @@ class ShopSession(object):
             一行。所以改为：优先 context.request 发原生 JSON（自带超时、不依赖页面
             JS 执行），失败再退回页面 fetch 并强制 wait_for 超时；分页改成并发，
             2000 条约二三十秒出结果。
+          - ★ v1.5.4：诊断证实**单个时间窗只能看 showNum（2000）条**，而近 90 天
+            totalNum 常有三五千条，直接翻 2000 条等于按比例缩水（实测 2 星只数出 5，
+            实际 13 ≈ 5135/2000×5）。改为**时间切片**：先看最近 2000 条，取这批最老的
+            createTime，把 endTime 设成它再往前续拉，直到 total≤showNum 或时间回到
+            startTime，按 reviewId 去重合并，从而覆盖近 90 天全量。
         """
         try:
             return await self._count_stars_by_api_impl(all_total)
@@ -1745,7 +1750,7 @@ class ShopSession(object):
 
         url = "https://mms.pinduoduo.com/saturn/reviews/list"
         notes = []
-        timeout_cap = 100.0
+        timeout_cap = 180.0
         deadline = time.time() + timeout_cap
         # 通道：ctx = context.request（首选，有超时）；page = 页面内 fetch（兜底）
         chan = {"v": "ctx", "page_timeout": 0}
@@ -1788,10 +1793,12 @@ class ShopSession(object):
                     break
             return res, n, res.get("showNum")
 
-        async def _post_via_ctx(page_no, size):
+        async def _post_via_ctx(page_no, size, end_ts=None):
             payload = dict(tmpl)
             payload["pageNo"] = page_no
             payload["pageSize"] = size
+            if end_ts:
+                payload["endTime"] = int(end_ts)
             resp = await self.context.request.post(
                 url, data=json.dumps(payload, ensure_ascii=False),
                 headers={"Content-Type": "application/json",
@@ -1806,10 +1813,12 @@ class ShopSession(object):
                 js = None
             return _digest(js, txt, resp.status)
 
-        async def _post_via_page(page_no, size):
+        async def _post_via_page(page_no, size, end_ts=None):
             payload = dict(tmpl)
             payload["pageNo"] = page_no
             payload["pageSize"] = size
+            if end_ts:
+                payload["endTime"] = int(end_ts)
             try:
                 out = await asyncio.wait_for(
                     self.page.evaluate(fetch_js, {"url": url, "payload": payload}),
@@ -1823,13 +1832,13 @@ class ShopSession(object):
                 raise RuntimeError("HTTP %s %s" % (out.get("status"), (out.get("head") or "")[:50]))
             return _digest(out.get("js"), out.get("head"), out.get("status"))
 
-        async def _post(page_no, size):
+        async def _post(page_no, size, end_ts=None):
             if time.time() > deadline:
                 raise RuntimeError("统计超时（%ds）" % int(timeout_cap))
             # ctx 通道单页偶发失败（限流）只让该页进重试；连续 3 次才永久切页面 fetch
             if chan["v"] == "ctx":
                 try:
-                    out = await _post_via_ctx(page_no, size)
+                    out = await _post_via_ctx(page_no, size, end_ts)
                     chan["ctx_fail"] = 0
                     return out
                 except asyncio.CancelledError:
@@ -1845,14 +1854,16 @@ class ShopSession(object):
                     raise
             if chan["page_timeout"] >= 2:
                 raise RuntimeError("页面fetch已连续超时，放弃")
-            return await _post_via_page(page_no, size)
+            return await _post_via_page(page_no, size, end_ts)
 
         # ---- 第 1 页：同时探测可用的 pageSize（50 → 20 → 10）----
         res1, n1, show1 = None, None, None
         page_size, last_err = 10, None
+        end_ts0 = int(tmpl.get("endTime") or 0) or None
+        start_ts0 = int(tmpl.get("startTime") or 0) or None
         for size_try in (50, 20, 10):
             try:
-                r_try, n_try, s_try = await _post(1, size_try)
+                r_try, n_try, s_try = await _post(1, size_try, end_ts0)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1876,12 +1887,11 @@ class ShopSession(object):
 
         total_rows = n1 if isinstance(n1, int) and n1 > 0 else None
         show_cap = show1 if isinstance(show1, int) and show1 > 0 else None
-        cap = show_cap or total_rows or all_total
-        pages_total = 1
-        if cap:
-            pages_total = max(1, min((int(cap) + page_size - 1) // page_size, 200))
-        self._log_api("总量 total=%s show=%s 每页%d 需翻%d页" % (
-            total_rows, show_cap, page_size, pages_total))
+        # 接口单个时间窗最多只看 showNum（通常 2000）条，而近 90 天往往有几千条：
+        # 所以覆盖率要以「全量 total」为分母，靠时间切片把整段时间分批拉完。
+        cap_total = total_rows or show_cap or all_total
+        self._log_api("总量 total=%s show=%s 每页%d 起始时间=%s 结束时间=%s" % (
+            total_rows, show_cap, page_size, start_ts0, end_ts0))
 
         counts = {1: 0, 2: 0, 3: 0}          # 未举报（界面展示用）
         counts_all = {1: 0, 2: 0, 3: 0}      # 全部（含已举报，诊断对照）
@@ -1891,14 +1901,22 @@ class ShopSession(object):
         errors = []
 
         def _absorb(res):
+            """吸收一页数据，同时返回该页最老的 createTime（给时间切片续拉用）。"""
             nonlocal scanned
             data = res.get("data") or res.get("reviewList") or res.get("list") or []
             if not isinstance(data, list):
                 return 0
-            new = 0
+            oldest = 0
             for item in data:
                 if not isinstance(item, dict):
                     continue
+                try:
+                    ct = int(item.get("createTime")
+                             or item.get("commentTime") or 0)
+                except Exception:
+                    ct = 0
+                if ct and (not oldest or ct < oldest):
+                    oldest = ct
                 rid = item.get("reviewId") or item.get("orderSn") or ""
                 if rid and rid in seen:
                     continue
@@ -1916,67 +1934,102 @@ class ShopSession(object):
                             (rr.get("desc") if isinstance(rr, dict) else None),
                             str(item.get("comment") or "")[:30])
                 scanned += 1
-                new += 1
-            return new
+            return oldest
 
-        _absorb(res1)
-
-        # ---- 其余页并发拉取（并发 4，温和，避免风控）----
-        if pages_total > 1:
-            sem = asyncio.Semaphore(4)
+        # ---- 批内并发拉页（并发 4，温和，避免风控；失败页再串行重试一次）----
+        async def _pull_pages(pages_b, end_ts):
             got = {}
 
-            async def _worker(pg):
+            async def _one(pg, sem):
                 async with sem:
                     if time.time() > deadline:
                         return
                     try:
-                        res, n, show = await _post(pg, page_size)
+                        res, n, show = await _post(pg, page_size, end_ts)
                         if isinstance(res, dict) and not res.get("_limit_reached"):
                             got[pg] = res
                     except asyncio.CancelledError:
                         raise
-                    except Exception as e:
-                        errors.append("%d页:%s" % (pg, str(e)[:30]))
+                    except Exception:
+                        pass
 
-            await asyncio.gather(*[_worker(pg) for pg in range(2, pages_total + 1)],
+            sem = asyncio.Semaphore(4)
+            await asyncio.gather(*[_one(pg, sem) for pg in range(2, pages_b + 1)],
                                  return_exceptions=True)
-            # 失败页串行重试一次（多半是并发限流），提高覆盖率再判定
-            retry = []
-            for e in errors:
-                try:
-                    pg = int(str(e).split("页:")[0])
-                except Exception:
-                    continue
-                if pg not in got:
-                    retry.append(pg)
-            if retry:
-                self._log_api("重试失败页 %d 个" % len(retry))
+            failed = [pg for pg in range(2, pages_b + 1) if pg not in got]
+            if failed:
+                self._log_api("本批重试失败页 %d 个" % len(failed))
                 sem2 = asyncio.Semaphore(2)
-
-                async def _retry_one(pg):
-                    async with sem2:
-                        if time.time() > deadline:
-                            return
-                        try:
-                            res, n, show = await _post(pg, page_size)
-                            if isinstance(res, dict) and not res.get("_limit_reached"):
-                                got[pg] = res
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            pass
-
-                await asyncio.gather(*[_retry_one(pg) for pg in retry],
+                await asyncio.gather(*[_one(pg, sem2) for pg in failed],
                                      return_exceptions=True)
-                errors = [e for e in errors
-                          if not str(e).split("页:")[0].isdigit()
-                          or int(str(e).split("页:")[0]) not in got]
-            for pg in sorted(got):
-                _absorb(got[pg])
-            self._log_api("并发完成 成功%d/%d页 失败%d 累计%d条 未举报=%s 全部=%s" % (
-                len(got), max(0, pages_total - 1), len(errors), scanned,
-                [counts[s] for s in (1, 2, 3)], [counts_all[s] for s in (1, 2, 3)]))
+                failed = [pg for pg in range(2, pages_b + 1) if pg not in got]
+            return got, failed
+
+        # ---- 时间切片：每批只看「end 往前最近 showNum 条」，再以最老时间续拉 ----
+        batch_log = []
+        cur_end = end_ts0
+        total_pages = 0
+        batch = 0
+        MAX_BATCH = 10
+        seen_ends = set()
+        while True:
+            batch += 1
+            if batch == 1:
+                res_b, total_b, show_b = res1, n1, show1
+            else:
+                try:
+                    res_b, total_b, show_b = await _post(1, page_size, cur_end)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    notes.append("第%d批探测失败：%s" % (batch, str(e)[:40]))
+                    self._log_api("第%d批探测失败:%s" % (batch, str(e)[:60]))
+                    break
+            if not isinstance(res_b, dict) or res_b.get("_limit_reached"):
+                break
+            show_b = show_b if isinstance(show_b, int) and show_b > 0 else 2000
+            if isinstance(total_b, int) and total_b >= 0:
+                cap_b = min(total_b, show_b)
+            else:
+                cap_b = show_b
+            pages_b = max(1, min((int(cap_b) + page_size - 1) // page_size, 200))
+            total_pages += pages_b
+
+            oldest = _absorb(res_b)
+            if pages_b > 1:
+                got, failed = await _pull_pages(pages_b, cur_end)
+                for pg in sorted(got):
+                    ct = _absorb(got[pg])
+                    if ct and (not oldest or ct < oldest):
+                        oldest = ct
+                if failed:
+                    errors.append("第%d批%d页失败" % (batch, len(failed)))
+            batch_log.append("批%d end=%s total=%s 拉%d页 累计%d条" % (
+                batch, cur_end or "-", total_b, pages_b, scanned))
+
+            # 这一批是否已经把区间内的评价全部拿到
+            if not isinstance(total_b, int) or total_b <= show_b:
+                break
+            if not oldest:
+                self._log_api("批%d 取不到最老时间，停止续拉" % batch)
+                break
+            nxt = oldest - 1
+            if start_ts0 and nxt <= start_ts0:
+                self._log_api("批%d 已回到起始时间，停止" % batch)
+                break
+            if nxt in seen_ends or (cur_end and nxt >= cur_end):
+                self._log_api("批%d 时间未推进，停止" % batch)
+                break
+            seen_ends.add(nxt)
+            cur_end = nxt
+            if batch >= MAX_BATCH:
+                self._log_api("达到最大批次 %d，停止" % MAX_BATCH)
+                break
+            if time.time() > deadline:
+                self._log_api("统计时间到（%ds），停止续拉" % int(timeout_cap))
+                break
+
+        self._log_api("分批完成 %d 批：%s" % (batch, "；".join(batch_log)))
         for st in (1, 2, 3):
             if st in samples:
                 self._log_api("  %d星样本: %s" % (st, samples[st]))
@@ -1986,23 +2039,29 @@ class ShopSession(object):
             notes.append("接口未返回任何评价数据")
             return {"counts": None, "notes": notes}
 
-        cov = (float(len(seen)) / float(cap)) if cap else None
+        cov = (float(len(seen)) / float(cap_total)) if cap_total else None
         enough = (isinstance(cov, float) and cov >= 0.6) or scanned >= 60
-        self._log_api("统计完成 scanned=%d cap=%s cov=%s enough=%s" % (
-            scanned, cap, ("%.0f%%" % (cov * 100)) if isinstance(cov, float) else "?", enough))
+        self._log_api("统计完成 scanned=%d cap=%s cov=%s enough=%s 未举报=%s 全部=%s" % (
+            scanned, cap_total,
+            ("%.0f%%" % (cov * 100)) if isinstance(cov, float) else "?",
+            enough, [counts[s] for s in (1, 2, 3)], [counts_all[s] for s in (1, 2, 3)]))
         if not enough:
-            notes.append("仅扫 %d 条（上限 %s，覆盖 %s），样本不足不采信" % (
-                scanned, cap, ("%.0f%%" % (cov * 100)) if isinstance(cov, float) else "?"))
+            notes.append("仅扫 %d 条（总量 %s，覆盖 %s），样本不足不采信" % (
+                scanned, cap_total,
+                ("%.0f%%" % (cov * 100)) if isinstance(cov, float) else "?"))
             return {"counts": None, "notes": notes}
         if errors:
-            notes.append("有 %d 页请求失败" % len(errors))
-        notes.append("扫 %d 条评价：未举报1/2/3星=%s，全部=%s" % (
-            scanned, [counts[s] for s in (1, 2, 3)], [counts_all[s] for s in (1, 2, 3)]))
+            notes.append("有部分页请求失败：%s" % "、".join(errors[:3]))
+        notes.append("扫 %d 条评价（共 %s 条，覆盖 %s）：未举报1/2/3星=%s，全部=%s" % (
+            scanned, cap_total,
+            ("%.0f%%" % (cov * 100)) if isinstance(cov, float) else "?",
+            [counts[s] for s in (1, 2, 3)], [counts_all[s] for s in (1, 2, 3)]))
         # counts 已是"未举报"数；source=api_reported 让 _apply_stars 跳过台账扣减
         return {"counts": counts, "counts_all": counts_all,
                 "source": "api_reported", "notes": notes,
-                "pageSize": page_size, "pages": pages_total,
-                "channel": chan["v"], "scanned": scanned}
+                "pageSize": page_size, "pages": total_pages,
+                "batches": batch, "scanned": scanned,
+                "channel": chan["v"]}
 
     def _log_api(self, text):
         self.api_call_log.append("%s %s" % (time.strftime("%H:%M:%S"), text))
@@ -2359,7 +2418,8 @@ class ShopSession(object):
                         break
         except Exception:
             pass
-        self.set(message="正在从评价接口统计 1/2/3 星（约需 20~40 秒，请稍候）…")
+        self.set(message="正在从评价接口统计 1/2/3 星"
+                         "（按时间分段拉全近 90 天，约需 30~60 秒，请稍候）…")
         try:
             api = await self.count_stars_by_api(all_total=all_total)
         except Exception as e:
