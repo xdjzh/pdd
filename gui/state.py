@@ -171,6 +171,70 @@ class ShopStore(object):
             return False
 
 
+DEFAULT_SETTINGS = {
+    "auto_task": False,        # 自动任务总开关：开机后自动登录+举报到上限
+    "auto_startup": False,     # 开机自启（注册表 Run 项）
+    "auto_date": "",           # 最近一次自动任务执行日期 YYYY-MM-DD（当天不重复）
+    "auto_result": "",         # 最近一次自动任务结果摘要（界面展示用）
+}
+
+
+class SettingsStore(object):
+    """全局设置（自动任务 / 开机自启）。独立 settings.json，线程安全。
+
+    与 ShopStore 分开，避免动到已经稳定的店铺清单格式。任何人都可以随时
+    把 auto_task 关掉——这就是用户说的「手动取消自动任务」，引擎每次循环
+    都会重新读这个开关，关掉后立刻停止，无需重启。
+    """
+
+    def __init__(self, base_dir=None, root=None):
+        self.root = root or os.path.join(base_dir or app_base_dir(), "pdd_data")
+        self.file = os.path.join(self.root, "settings.json")
+        self._lock = threading.RLock()
+        os.makedirs(self.root, exist_ok=True)
+        self._data = self._load()
+
+    def _load(self):
+        out = dict(DEFAULT_SETTINGS)
+        try:
+            if os.path.exists(self.file):
+                with open(self.file, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if isinstance(d, dict):
+                    for k in DEFAULT_SETTINGS:
+                        if k in d:
+                            out[k] = d[k]
+        except Exception:
+            pass
+        return out
+
+    def _save(self):
+        tmp = self.file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.file)
+
+    def get(self, key, default=None):
+        with self._lock:
+            return self._data.get(key, DEFAULT_SETTINGS.get(key, default))
+
+    def set(self, key, value):
+        with self._lock:
+            self._data[key] = value
+            self._save()
+
+    def update(self, **kw):
+        with self._lock:
+            for k, v in kw.items():
+                if k in DEFAULT_SETTINGS:
+                    self._data[k] = v
+            self._save()
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._data)
+
+
 def blank_state(name=""):
     """GUI 表格所需的全部状态字段。"""
     return {

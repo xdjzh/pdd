@@ -123,8 +123,10 @@ def main():
     if not session:
         return 1
 
+    # --minimized 由开机自启项传入：窗口最小化到任务栏，后台照常跑自动任务
+    minimized = "--minimized" in sys.argv
     from gui.app import main as gui_main
-    gui_main(license_session=session)
+    gui_main(license_session=session, minimized=minimized)
     return 0
 
 

@@ -290,6 +290,15 @@ class PillButton(tk.Canvas):
                           font=(self.fam, self.size,
                                 "bold" if self.kind == "primary" else "normal"))
 
+    def set_text(self, text, kind=None):
+        """运行时改按钮文字（可选同时改层级），用于开关类按钮的状态显示。"""
+        self.text = text
+        if kind and kind in self.KINDS:
+            self.kind = kind
+        measure = tkfont.Font(family=self.fam, size=self.size).measure(text)
+        self.pw = max(74, int(measure) + self.padx * 2 + (20 if self.icon else 0))
+        self.draw()
+
     def _on_enter(self, _e):
         self.hover = True
         self.draw()

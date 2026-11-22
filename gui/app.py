@@ -23,7 +23,8 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 from .engine import Engine
-from .state import ShopStore, app_base_dir
+from .state import ShopStore, SettingsStore, app_base_dir
+from . import autostart
 from .theme import (PALETTES, Chip, PillButton, StatCard, draw_icon,
                     font_family, gradient, load_theme, mix, round_rect,
                     save_theme)
@@ -152,14 +153,16 @@ def _post_update(url, action, payload=None, timeout=8):
 
 
 class App(object):
-    def __init__(self, root, store, license_session=None):
+    def __init__(self, root, store, license_session=None, minimized=False):
         self.root = root
         self.store = store
         self.license_session = license_session
+        self.start_minimized = bool(minimized)
         self._license_blocked = False
         self._license_checking = False
         self._last_license_check = 0.0
-        self.engine = Engine(store)
+        self.settings = SettingsStore(root=store.root)
+        self.engine = Engine(store, settings=self.settings)
         self.fam = font_family()
         self.fs = _sizes()
         self.theme_file = os.path.join(store.root, "ui_theme.json")
@@ -178,6 +181,12 @@ class App(object):
         if not self._tick_started:
             self._tick_started = True
             self.root.after(400, self._tick)
+        # 开机自启时最小化到任务栏：不打扰用户，但仍可随时点开看自动任务进度
+        if getattr(self, "start_minimized", False):
+            try:
+                self.root.after(300, self.root.iconify)
+            except Exception:
+                pass
         # 启动后静默检查一次；刚装过热更新或云端有新版都会主动弹窗告知
         self.root.after(1200, lambda: self._check_update(manual=False))
 
@@ -449,7 +458,13 @@ class App(object):
                  bg=t["bg"], fg=t["muted"],
                  font=(self.fam, self.fs["sm"])).pack(anchor="w", pady=(3, 0))
         Chip(head, t, "单入口模式 · 遇风控自动暂停",
-             fam=self.fam, size=self.fs["xs"]).pack(side=tk.RIGHT)
+             fam=self.fam, size=self.fs["xs"]).pack(side=tk.RIGHT, padx=(8, 0))
+        # 自动任务开关（开机后自动登录+举报到上限）。点击切换，文字/配色随状态变化。
+        self.auto_btn = PillButton(head, t, "自动任务：关", self.toggle_auto_task,
+                                   kind="secondary", fam=self.fam, size=self.fs["xs"],
+                                   icon="shield")
+        self.auto_btn.pack(side=tk.RIGHT)
+        self._refresh_auto_task_ui()
 
         # 三张数据卡（固定 96px 高，防止窗口变小时 pack 压扁卡片）
         stats = tk.Frame(page, bg=t["bg"], height=96)
@@ -623,6 +638,19 @@ class App(object):
         ops.add_command(label="清除当日上限标记", command=self.do_clear_limit)
         m.add_cascade(label="操作", menu=ops)
 
+        auto = self._menu(m)
+        self._auto_menu_var = tk.BooleanVar(value=bool(self.settings.get("auto_task")))
+        auto.add_checkbutton(label="启用自动任务（每天开机自动登录+举报到上限）",
+                             variable=self._auto_menu_var,
+                             command=self.toggle_auto_task)
+        self._startup_menu_var = tk.BooleanVar(value=autostart.is_enabled())
+        auto.add_checkbutton(label="开机自动启动本软件",
+                             variable=self._startup_menu_var,
+                             command=self.toggle_auto_startup)
+        auto.add_separator()
+        auto.add_command(label="查看自动任务说明", command=self.do_auto_help)
+        m.add_cascade(label="自动任务", menu=auto)
+
         nav = self._menu(m)
         for key, label, _ready, _icon in NAV_ITEMS:
             nav.add_command(label=label,
@@ -670,6 +698,13 @@ class App(object):
                 self._last_license_check = time.time()
                 self._async_license_check()
             for ev in self.engine.pop_events():
+                if ev[0] == "auto_task":
+                    # 自动任务进度/结果只写状态栏，不弹窗打扰
+                    try:
+                        self.status_var.set(ev[1])
+                    except Exception:
+                        pass
+                    continue
                 if ev[0] == "daily_limit":
                     _, sid, name, reported = ev
                     messagebox.showwarning(
@@ -1086,6 +1121,80 @@ class App(object):
                 continue
             self.engine.call("start_report", sid)
 
+    # ---------- 自动任务 / 开机自启 ----------
+    def _refresh_auto_task_ui(self):
+        """按当前设置刷新自动任务按钮文字与配色。"""
+        try:
+            on = bool(self.settings.get("auto_task"))
+            txt = "自动任务：开" if on else "自动任务：关"
+            kind = "primary" if on else "secondary"
+            if hasattr(self, "auto_btn"):
+                self.auto_btn.set_text(txt, kind=kind)
+        except Exception:
+            pass
+
+    def toggle_auto_task(self):
+        """一键开/关自动任务。关掉即「手动取消」，引擎下轮立即停止。"""
+        on = bool(self.settings.get("auto_task"))
+        new = not on
+        self.settings.set("auto_task", new)
+        self._refresh_auto_task_ui()
+        try:
+            self._auto_menu_var.set(new)
+        except Exception:
+            pass
+        if new:
+            # 开启时顺带询问是否注册开机自启
+            if not autostart.is_enabled():
+                if messagebox.askyesno(
+                        "开机自启", "自动任务已开启。\n\n"
+                        "是否同时设置「开机自动启动本软件」？\n"
+                        "这样每天开机后会自动登录并举报到上限。",
+                        parent=self.root):
+                    ok, msg = autostart.enable()
+                    if ok:
+                        self.settings.set("auto_startup", True)
+                    messagebox.showinfo("开机自启", msg, parent=self.root)
+            self.status_var.set("自动任务已开启：明天开机后自动登录并举报到上限")
+        else:
+            self.status_var.set("自动任务已关闭（手动取消）")
+
+    def toggle_auto_startup(self):
+        """单独开/关开机自启。"""
+        if autostart.is_enabled():
+            ok, msg = autostart.disable()
+            if ok:
+                self.settings.set("auto_startup", False)
+        else:
+            ok, msg = autostart.enable()
+            if ok:
+                self.settings.set("auto_startup", True)
+        try:
+            self._startup_menu_var.set(autostart.is_enabled())
+        except Exception:
+            pass
+        messagebox.showinfo("开机自启", msg, parent=self.root)
+
+    def do_auto_help(self):
+        last = self.settings.get("auto_result") or "尚未执行"
+        adate = self.settings.get("auto_date") or "—"
+        on = "已开启" if self.settings.get("auto_task") else "已关闭"
+        boot = "已开启" if autostart.is_enabled() else "未开启"
+        messagebox.showinfo(
+            "自动任务说明",
+            "当前状态\n"
+            "  自动任务：%s\n"
+            "  开机自启：%s\n"
+            "  上次执行日期：%s\n"
+            "  上次结果：%s\n\n"
+            "工作方式：\n"
+            "  1. 开启后，每天开机软件会自动登录所有已保存登录态的店铺；\n"
+            "  2. 逐个自动举报 1/2/3 星差评，直到该店当日上限；\n"
+            "  3. 同一天只跑一次，不会重复消耗举报额度；\n"
+            "  4. 想停掉：点标题区「自动任务」按钮，或菜单里取消勾选，"
+            "随时生效、无需重启。" % (on, boot, adate, last),
+            parent=self.root)
+
     def do_stop(self):
         self._call("stop")
 
@@ -1159,8 +1268,8 @@ class App(object):
         self.root.destroy()
 
 
-def main(license_session=None):
+def main(license_session=None, minimized=False):
     store = ShopStore()
     root = tk.Tk()
-    App(root, store, license_session=license_session)
+    App(root, store, license_session=license_session, minimized=minimized)
     root.mainloop()

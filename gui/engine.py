@@ -23,8 +23,9 @@ TICK_SECONDS = 3
 
 
 class Engine(object):
-    def __init__(self, store):
+    def __init__(self, store, settings=None):
         self.store = store
+        self.settings = settings          # SettingsStore，自动任务开关/日期
         self.sessions = {}
         self.states = {}
         self._state_lock = threading.RLock()
@@ -71,6 +72,12 @@ class Engine(object):
         # （并发，共享浏览器由 _browser_lock 保护；不弹任何浏览器窗口）
         await asyncio.gather(*[s.boot() for s in list(self.sessions.values())],
                              return_exceptions=True)
+        # 自动任务：开机后若用户开启了开关、且今天还没跑过，自动登录并举报到上限。
+        # 放在 boot 之后，确保登录态已恢复、在线状态已就绪。
+        try:
+            asyncio.ensure_future(self._auto_task())
+        except Exception:
+            traceback.print_exc()
         while not self._closed:
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=TICK_SECONDS)
@@ -92,6 +99,61 @@ class Engine(object):
                     pass
                 except Exception:
                     traceback.print_exc()
+
+    # ---------- 自动任务 ----------
+    async def _auto_task(self):
+        """开机后自动登录+举报到上限，每个店铺跑到当日上限为止。
+
+        规则：
+          - 仅当 settings.auto_task 开启时执行（用户随时可关 = 手动取消）；
+          - 同一天只执行一次（auto_date 去重），跨天自动允许；
+          - 逐个店铺串行：跳过未登录、已到上限的；每跑完一个再跑下一个；
+          - 全程可随时被用户点「停止」或被关掉开关打断。
+        """
+        st = self.settings
+        if not st:
+            return
+        # 再等一小段时间，让 boot 的 refresh_stars 收尾、UI 完成初始化
+        await asyncio.sleep(2)
+        if self._closed or not st.get("auto_task"):
+            return
+        today = time.strftime("%Y-%m-%d")
+        if st.get("auto_date") == today:
+            self.emit("auto_task", "今日已执行过自动任务，跳过")
+            return
+        sessions = [s for s in list(self.sessions.values())
+                    if s.store.has_login(s.id)]
+        if not sessions:
+            self.emit("auto_task", "自动任务：没有已登录店铺，等待下次开机")
+            st.update(auto_result="无已登录店铺")
+            return
+        total = 0
+        ran = 0
+        for s in sessions:
+            if self._closed or not st.get("auto_task"):
+                break
+            # 用户中途把开关关了 = 手动取消，立即停
+            if not s.store.has_login(s.id):
+                continue
+            if s.core.daily_limit_state():
+                continue  # 今天已到上限
+            if s.busy():
+                continue  # 用户正在手动操作这家，跳过不打断
+            try:
+                self.emit("auto_task", "自动举报：%s" % s.name)
+                await s.run_exclusive(s.run_report(), kind="report")
+                total += int(getattr(s, "reported", 0) or 0)
+                ran += 1
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                traceback.print_exc()
+        result = "自动举报完成：%d 家店铺，共 %d 条" % (ran, total)
+        # 只要开关仍开着、跑完这一轮，就标记今天已执行，避免重复耗尽额度
+        if st.get("auto_task"):
+            st.update(auto_date=today, auto_result=result)
+        self.emit("auto_task", result)
 
     async def _cleanup(self):
         for s in list(self.sessions.values()):

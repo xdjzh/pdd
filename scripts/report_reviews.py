@@ -42,11 +42,13 @@ USER_DATA_DIR = str(Path(__file__).parent.parent / "assets" / "browser_data")
 # 是 /goods/evaluation/index。保留多个候选，运行时按落地 URL 校验逐个尝试。
 REVIEW_MANAGE_URL = "https://mms.pinduoduo.com/goods/evaluation/index?msfrom=mms_sidenav"
 REVIEW_PAGE_URLS = [
-    # 侧栏「评价管理」真实链接带 msfrom=mms_sidenav，裸路径在部分店铺会被
-    # 重定向回商品列表，所以带参数的放第一位。
+    # ⭐ 2026-11 后台改版：/goods/evaluation/index 默认渲染「评价管理/互动动态」
+    #    子页（SPA 跳到 /goods/evalution/dynamic），那页没有星级筛选、没有举报
+    #    按钮，分页里的 N 条是互动留言。侧栏真正带举报功能的入口是
+    #    ?sellerRightProtect=1（菜单文字「评价举报」），必须优先尝试。
+    "https://mms.pinduoduo.com/goods/evaluation/index?sellerRightProtect=1",
     "https://mms.pinduoduo.com/goods/evaluation/index?msfrom=mms_sidenav",
     "https://mms.pinduoduo.com/goods/evaluation/index",
-    "https://mms.pinduoduo.com/goods/evaluation/index?sellerRightProtect=1",
     "https://mms.pinduoduo.com/goods/evaluate/list",
 ]
 
@@ -679,8 +681,10 @@ class PinduoduoReviewReporter:
     @staticmethod
     def _is_review_page_url(url):
         u = (url or "").lower()
-        return (("evaluat" in u or "comment" in u or "review" in u)
-                and "goods_list" not in u)
+        good = ("evaluat" in u or "comment" in u or "review" in u)
+        bad = ("goods_list" in u or "evalution/dynamic" in u or
+               "interact" in u)
+        return good and not bad
 
     async def navigate_to_review_management(self):
         """导航到评价管理页面，并确认真的落在评价页。

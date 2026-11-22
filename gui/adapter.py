@@ -365,16 +365,24 @@ PAGE_KIND_JS = r"""
     if (links.length >= 12) break;
   }
   const goodsList = /goods_list/.test(u) || /商品列表/.test(t);
-  const reviewUrl = /evaluat|comment|review/i.test(u) && !goodsList;
+  // 拼多多新版把「评价管理」拆出「互动动态」子页（/goods/evalution/dynamic），
+  // 那页只有「近90天+查询+回复+隐藏评论」，既没有星级筛选也没有「举报」按钮，
+  // 分页里的「共有 N 条」是互动留言数，绝不是评价数。必须排除，否则程序
+  // 误当评价页，读出 18 条互动留言当评价，再把它当成「全部评价」基准去校验。
+  const interactDynamic = /evalution\/dynamic|interact.*dynamic|互动动态/.test(u) ||
+                          /互动动态/.test(body.slice(0, 800));
+  const reviewUrl = /evaluat|comment|review/i.test(u) && !goodsList && !interactDynamic;
   const starTextCount = (body.match(/给出了\s*[1-5]\s*星|用户评价分/g) || []).length;
   const reportBtnCount = (body.match(/举报/g) || []).length;
   // 商品列表页绝不会有「给出了 N 星」的评价卡片；若两类评价特征同时出现，
   // 即使 SPA 没改 URL，也要认定已经进入评价页。
   const reviewContent = starTextCount > 0 && reportBtnCount >= 3;
   return {
-    url: u, title: t, goodsList: goodsList, reviewUrl: reviewUrl,
-    isReview: ((!goodsList && (reviewUrl || starTextCount > 0 ||
-              (/评价管理|评价举报/.test(body) && reportBtnCount >= 3))) || reviewContent),
+    url: u, title: t, goodsList: goodsList, interactDynamic: interactDynamic,
+    reviewUrl: reviewUrl,
+    isReview: ((!goodsList && !interactDynamic &&
+                (reviewUrl || starTextCount > 0 ||
+                 (/评价管理|评价举报/.test(body) && reportBtnCount >= 3))) || reviewContent),
     links: links, starTextCount: starTextCount,
     reportBtnCount: reportBtnCount, head: clean(body).slice(0, 300)
   };
@@ -466,11 +474,39 @@ STAR_DIAG_JS = r"""
 # ------------------------------------------------------------------
 _API_KEYWORDS = ("evaluate", "comment", "review", "appraise", "remark",
                  "feedback", "goods/list", "getlist")
-_STAR_FIELD_RE = re.compile(r"^(star|starlevel|star_level|score|level|rating|grade|starnum)$", re.I)
+_STAR_FIELD_RE = re.compile(
+    r"^(star|starlevel|star_level|starlevel|score|level|rating|grade|starnum|"
+    r"starlevelnum|evaluationlevel|evaluationscore|goodsstar|goodsstarlevel)$", re.I)
 _COUNT_FIELD_RE = re.compile(r"^(count|num|cnt|total|totalcount|total_num|totalnum|"
-                             r"totalsize|totalrows|reviewnum|commentnum|evaluatenum)$", re.I)
+                             r"totalsize|totalrows|reviewnum|commentnum|evaluatenum|"
+                             r"amount|quantity|numcount)$", re.I)
 _TOTAL_FIELD_RE = re.compile(r"^(total|totalcount|total_count|totalnum|total_num|"
                              r"totalsize|total_size|totalrows|cnt)$", re.I)
+# 中文/带数字的星级键名：1星 / 一星 / star1Count / oneStarNum 等
+_STAR_KEY_CN = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
+_STAR_KEY_WORD = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+
+
+def _star_key_to_int(k):
+    """把键名里的星级解析成 1-5；解析不出返回 None。"""
+    ks = str(k).strip()
+    if ks in ("1", "2", "3", "4", "5"):
+        return int(ks)
+    m = re.match(r"^([一二三四五one|two|three|four|five]+)\s*星?", ks, re.I)
+    if m:
+        for ch in m.group(1).lower():
+            if ch in _STAR_KEY_CN:
+                return _STAR_KEY_CN[ch]
+        for w, n in _STAR_KEY_WORD.items():
+            if w in m.group(1).lower():
+                return n
+    m = re.search(r"star\s*([1-5])", ks, re.I)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"([1-5])\s*star", ks, re.I)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def _is_count(v):
@@ -766,6 +802,7 @@ class ShopSession(object):
         self.star_note = ""
         self.api_hints = []     # 最近若干条评价接口响应摘要
         self.api_urls = []      # 页面实际发过的 XHR 地址（诊断用）
+        self.api_call_log = []  # count_stars_by_api 执行日志（诊断用，避免盲试）
         self._diag_uploaded_at = 0.0   # 失败诊断自动回传去重
         self.page_kind = ""        # review / goods_list / login / unknown
         self.page_url = ""         # 最近一次实际落地地址
@@ -1276,6 +1313,31 @@ class ShopSession(object):
         except Exception:
             pass
 
+    @staticmethod
+    def _mask_deep(o, limit=None):
+        """递归脱敏：长数字串（订单号/手机号）打码，字符串截断，控制体积。"""
+        import re as _re
+        def mask_str(s):
+            s = _re.sub(r"\d{8,}", "<NUM>", s)
+            s = _re.sub(r"([?&](?:token|access_token|sign|anti[^=]*)=)[^&\s]{8,}",
+                        r"\1<TOKEN>", s, flags=_re.I)
+            return s[:2000]
+        if isinstance(o, str):
+            return mask_str(o)
+        if isinstance(o, (int, float, bool)) or o is None:
+            return o
+        if isinstance(o, list):
+            return [ShopSession._mask_deep(x) for x in o[:60]]
+        if isinstance(o, dict):
+            out = {}
+            for i, (k, v) in enumerate(o.items()):
+                if limit and i >= limit:
+                    out["..."] = "(截断)"
+                    break
+                out[str(k)] = ShopSession._mask_deep(v)
+            return out
+        return str(o)[:500]
+
     async def _absorb_response(self, response, url):
         try:
             raw = await response.text()
@@ -1285,12 +1347,51 @@ class ShopSession(object):
         except Exception:
             return
         star_map, totals = parse_star_payload(data)
-        self.api_hints.append({
+        # 请求方法 / post 参数：拼多多星级筛选接口靠它区分星级，诊断必须带上
+        method, post_data = "", ""
+        try:
+            req = response.request
+            method = getattr(req, "method", "") or ""
+            post_data = getattr(req, "post_data", None) or ""
+        except Exception:
+            pass
+        hint = {
             "ts": time.time(), "url": url[:200],
             "starMap": star_map or {},
             "totals": totals,
             "rawHead": re.sub(r"\d{8,}", "<NUM>", raw[:300]),
-        })
+        }
+        # 关键评价接口：留完整脱敏响应体，用于精确校准星级字段。
+        # 只留 /saturn/reviews/ 系列（星级统计/列表），避免诊断包过大。
+        low = url.lower()
+        if "/saturn/reviews/" in low or "/review/analyze" in low:
+            try:
+                result = data.get("result") if isinstance(data, dict) else data
+                # 只留顶层标量 + 每个 list/dict 的首项，控制诊断包体积
+                slim = {}
+                if isinstance(result, dict):
+                    for k, v in result.items():
+                        if isinstance(v, (int, float, bool, str, type(None))):
+                            slim[k] = v
+                        elif isinstance(v, list) and v:
+                            slim[k] = ["(共%d项，首项样本)" % len(v),
+                                       self._mask_deep(v[0])]
+                        elif isinstance(v, dict):
+                            slim[k] = self._mask_deep(v, limit=12)
+                else:
+                    slim = self._mask_deep(result)
+                hint["fullResult"] = slim
+                hint["method"] = method
+                if post_data and post_data[:1] in "{[":
+                    try:
+                        hint["postData"] = self._mask_deep(json.loads(post_data))
+                    except Exception:
+                        hint["postData"] = re.sub(r"\d{8,}", "<NUM>", post_data)[:800]
+                elif post_data:
+                    hint["postData"] = re.sub(r"\d{8,}", "<NUM>", post_data)[:800]
+            except Exception:
+                pass
+        self.api_hints.append(hint)
         del self.api_hints[:-16]
 
     def _recent_star_map(self, max_age=90, since=0):
@@ -1351,9 +1452,21 @@ class ShopSession(object):
         return result
 
     def _apply_stars(self, values, source, ok, note=""):
-        # 不可靠时连内部值也清零，避免顶部统计卡把假数字加总（7+7+7=21）
-        raw = {k: max(0, int(values.get(k, 0) or 0)) for k in (1, 2, 3)} if ok \
-              else {1: 0, 2: 0, 3: 0}
+        # ★ 反复刷新保护：读不到可信数时【保留上一次可信读数】，不清零、不覆盖。
+        #   旧实现把内部值清零 → 顶部合计闪成 0；再加上多次刷新状态互相踩，
+        #   表现为「没动再查数字越来越多/忽大忽小」。只有明确读到可信数才更新。
+        if not ok:
+            self.stars_ok = False
+            self.stars_source = "none"
+            self.star_note = str(note)[:220]
+            self.last_check = time.strftime("%H:%M:%S")
+            keep = sum(self.stars.get(k, 0) for k in (1, 2, 3))
+            msg = ("未读到可信的评价数量，已保留上次读数（%s）；诊断已本地留档，"
+                   "可点「刷新数量」重试" % (str(keep) if keep else "—"))
+            self.set(message=msg)
+            self.engine.publish(self)
+            return
+        raw = {k: max(0, int(values.get(k, 0) or 0)) for k in (1, 2, 3)}
         # 平台返回的是全量评价数（含举报中/举报成功），界面只显示未举报的：
         # 统一在这里按台账扣除，顶部「待处理差评」合计与列表 1/2/3 星都会跟着变。
         rep = self._reported_count_by_star() if ok else {1: 0, 2: 0, 3: 0}
@@ -1528,6 +1641,185 @@ class ShopSession(object):
         return {"counts": {s: vals[s] for s in (1, 2, 3)},
                 "distinct": len(set(vals.values())) > 1, "notes": notes}
 
+    @staticmethod
+    def _item_star(item):
+        """从一条评价里解析星级（1-5）。诊断确认字段是 descScore。"""
+        if not isinstance(item, dict):
+            return None
+        for k in ("descScore", "score", "star", "starLevel", "evaluateScore",
+                  "goodsScore", "level"):
+            v = item.get(k)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)) and 1 <= int(v) <= 5:
+                return int(v)
+            if isinstance(v, str) and v.strip().isdigit() and 1 <= int(v) <= 5:
+                return int(v)
+        return None
+
+    async def count_stars_by_api(self, all_total=None):
+        """直接调用评价列表接口，分页拉取评价、按 descScore 统计 1/2/3 星。
+
+        ★ v1.4.3 关键修正：诊断证实 /saturn/reviews/list 的请求参数只有
+          pageNo/pageSize/startTime/endTime/orderSn，**没有星级筛选字段**，
+          所以 v1.4.2 猜 star/starLevel/score 参数全部无效（读回的都是全量 5128）。
+          真实星级在返回评价的 `descScore` 字段里，必须拉数据本地统计。
+
+        策略：
+          A) 先试星级筛选参数（少数店铺新版接口可能支持），命中即读 totalNum，最快；
+          B) 否则用大 pageSize 分页拉全部评价，按 descScore 统计，覆盖足够比例才采信。
+
+        返回 {"counts", "notes"} 或 None。拿不准就返回 None，绝不猜数。
+        """
+        if not self.page:
+            self._log_api("跳过：无 page")
+            return None
+        # 找 /saturn/reviews/list 的真实参数模板（pageNo/pageSize/startTime/endTime/orderSn）
+        tmpl = None
+        for h in reversed(self.api_hints):
+            u = (h.get("url") or "").lower()
+            if "/reviews/list" in u and h.get("postData"):
+                tmpl = h.get("postData")
+                break
+        if not isinstance(tmpl, dict):
+            self._log_api("跳过：api_hints 里没有 reviews/list 的 postData 模板")
+            return None
+        self._log_api("模板参数=%s" % json.dumps(tmpl, ensure_ascii=False)[:220])
+        url = "https://mms.pinduoduo.com/saturn/reviews/list"
+        notes = []
+
+        # 关键修复：必须在"页面上下文"里用 fetch 发原生 JSON 请求。
+        # 之前用 context.request.post(data=dict) 发的是 application/x-www-form-urlencoded
+        # 表单，拼多多接口不认，全部读不到。页面内 fetch 会自动带 Cookie 和反爬风险头。
+        fetch_js = """
+        async (arg) => {
+          const r = await fetch(arg.url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            credentials: 'include',
+            body: JSON.stringify(arg.payload)
+          });
+          const txt = await r.text();
+          let js = null;
+          try { js = JSON.parse(txt); } catch (e) {}
+          return {status: r.status, head: txt.slice(0, 160), js: js};
+        }
+        """
+
+        async def _post(page_no, size):
+            payload = dict(tmpl)
+            payload["pageNo"] = page_no
+            payload["pageSize"] = size
+            out = await self.page.evaluate(fetch_js, {"url": url, "payload": payload})
+            if not isinstance(out, dict):
+                raise RuntimeError("fetch 返回非对象")
+            if out.get("status") != 200:
+                raise RuntimeError("HTTP %s %s" % (out.get("status"), out.get("head", "")[:80]))
+            js = out.get("js")
+            if not isinstance(js, dict):
+                raise RuntimeError("非JSON %s" % out.get("head", "")[:80])
+            # 2000010 = 「仅支持查看近2000条评价」：到达可查看上限，正常收尾，不当异常。
+            if js.get("success") is False:
+                code = js.get("errorCode")
+                msg = str(js.get("errorMsg") or "")
+                if code == 2000010 or "2000" in msg:
+                    return {"_limit_reached": True}, None, None
+                raise RuntimeError("业务错误 %s %s" % (code, msg[:50]))
+            res = js.get("result")
+            if not isinstance(res, dict):
+                raise RuntimeError("无result %s" % out.get("head", "")[:80])
+            n = None
+            for nk in ("totalNum", "totalRows", "total", "totalCount"):
+                if isinstance(res.get(nk), int) and res[nk] >= 0:
+                    n = res[nk]
+                    break
+            show = res.get("showNum")
+            return res, n, show
+
+        # 分页拉评价，按 descScore 统计 1/2/3 星。
+        # ★ v1.4.5：诊断证实 pageSize=100 会触发 errorCode 2000010「仅支持查看近2000条」，
+        #   页面自身成功请求用的是 pageSize=10，必须回退到该值；可查看上限 2000 条 =
+        #   200 页，max_pages 相应提到 205。
+        counts = {1: 0, 2: 0, 3: 0}
+        seen = set()
+        page_no, page_size, max_pages = 1, 10, 205
+        total_rows, show_cap, scanned = None, None, 0
+        samples = {}
+        consecutive_empty = 0
+        while page_no <= max_pages:
+            try:
+                res, n, show = await _post(page_no, page_size)
+            except Exception as e:
+                self._log_api("第%d页异常:%s" % (page_no, str(e)[:70]))
+                notes.append("第%d页异常:%s" % (page_no, str(e)[:30]))
+                break
+            if res.get("_limit_reached"):
+                self._log_api("第%d页到达接口可查看上限(仅近2000条)，正常收尾" % page_no)
+                notes.append("已翻到接口可查看上限（近2000条）")
+                break
+            if isinstance(n, int) and n > 0:
+                total_rows = n
+            if isinstance(show, int) and show > 0:
+                show_cap = show
+            data = res.get("data") or res.get("reviewList") or res.get("list") or []
+            if not isinstance(data, list):
+                data = []
+            page_new = 0
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                rid = item.get("reviewId") or item.get("orderSn") or ""
+                if rid and rid in seen:
+                    continue
+                if rid:
+                    seen.add(rid)
+                star = self._item_star(item)
+                if star in counts:
+                    counts[star] += 1
+                    if star not in samples:
+                        samples[star] = str(item.get("comment") or "")[:40]
+                scanned += 1
+                page_new += 1
+            self._log_api("第%d页 size=%d 返回%d条 新增%d条 累计%d星分布=%s total=%s show=%s" % (
+                page_no, page_size, len(data), page_new, scanned,
+                [counts[s] for s in (1, 2, 3)], total_rows, show_cap))
+            if page_new == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
+            else:
+                consecutive_empty = 0
+            cap = show_cap or total_rows
+            if cap and len(seen) >= cap:
+                break
+            if len(data) < page_size:
+                break
+            page_no += 1
+            await asyncio.sleep(0.1)
+
+        if scanned == 0:
+            self._log_api("结果：scanned=0，放弃")
+            return None
+        # 采信门槛：接口只放出 showNum 条，能翻到上限或至少 60 条即可；
+        # 且 1/2/3 星里至少有一类 > 0（纯 4/5 星的店允许 0/0/0，但要有足够样本）。
+        cap = show_cap or total_rows
+        cov = (float(len(seen)) / cap) if cap else None
+        enough = (isinstance(cov, float) and cov >= 0.9) or scanned >= 60
+        self._log_api("完成：scanned=%d cap=%s cov=%s enough=%s counts=%s" % (
+            scanned, cap, ("%.0f%%" % (cov * 100)) if isinstance(cov, float) else "?",
+            enough, [counts[s] for s in (1, 2, 3)]))
+        if not enough:
+            notes.append("仅扫 %d 条（上限 %s，覆盖 %s），样本不足不采信" % (
+                scanned, cap, ("%.0f%%" % (cov * 100)) if isinstance(cov, float) else "?"))
+            return {"counts": None, "notes": notes}
+        notes.append("接口逐条统计 %d 条评价（%d 页，上限 %s）1/2/3星=%s" % (
+            scanned, page_no, cap, [counts[s] for s in (1, 2, 3)]))
+        return {"counts": counts, "notes": notes}
+
+    def _log_api(self, text):
+        self.api_call_log.append("%s %s" % (time.strftime("%H:%M:%S"), text))
+        del self.api_call_log[:-40]
+
     async def count_stars_by_cards(self, max_pages=12, max_seconds=55):
         """逐页统计评价卡片的星级，完全不依赖星级筛选控件。
 
@@ -1638,6 +1930,7 @@ class ShopSession(object):
             "navLog": getattr(self, "nav_log", []),
             "page": page_info, "cardProbe": card_probe,
             "apiUrls": self.api_urls[-30:], "apiHints": self.api_hints[-10:],
+            "apiCallLog": getattr(self, "api_call_log", []),
         }
 
     async def _desktop_paths(self, tag):
@@ -1727,8 +2020,20 @@ class ShopSession(object):
             A("   %s" % u)
         A("   本会话接口摘要：")
         for h in (payload.get("apiHints") or [])[:8]:
-            A("   - %s  starMap=%s totals=%s" %
-              (h.get("url"), h.get("starMap"), h.get("totals")))
+            A("   - %s  starMap=%s totals=%s method=%s" %
+              (h.get("url"), h.get("starMap"), h.get("totals"), h.get("method", "")))
+            if h.get("postData") is not None:
+                A("       postData=%s" % str(h.get("postData"))[:600])
+            if h.get("fullResult") is not None:
+                A("       fullResult=%s" % str(h.get("fullResult"))[:2500])
+        A("")
+        A("【8b. 接口直读执行日志（count_stars_by_api）】")
+        logs = payload.get("apiCallLog") or []
+        if logs:
+            for line in logs:
+                A("   %s" % line)
+        else:
+            A("   (空 —— 说明接口直读根本没被调用，或被前置分支拦截)")
         A("")
         A("【9. iframe / 全局数据】")
         A("frames=%s" % (page.get("frames") or []))
@@ -1849,6 +2154,31 @@ class ShopSession(object):
         tabs = pick_tab_counts(snap.get("tabRaw"))
         if tabs:
             self._apply_stars(tabs, "tab", True, "来自页面星级标签")
+            return
+
+        # 2.5) 主动调用评价列表接口按星级筛选（v1.4.2 新增）
+        #   新版后台落到「互动动态」子页，没有星级筛选控件，页面读数走不通；
+        #   评价数据来自 /saturn/reviews/list，复用它的请求参数逐个星级重放。
+        all_total = None
+        try:
+            for h in reversed(self.api_hints):
+                if "/reviews/list" in (h.get("url") or "").lower():
+                    for t in (h.get("totals") or []):
+                        if isinstance(t, int) and t > 0:
+                            all_total = t
+                            break
+                    if all_total:
+                        break
+        except Exception:
+            pass
+        try:
+            api = await self.count_stars_by_api(all_total=all_total)
+        except Exception as e:
+            api = None
+            self.set(message="接口星级统计异常：%s" % str(e)[:60])
+        if api and api.get("counts"):
+            note = "评价接口按星级筛选：" + "，".join(api.get("notes") or [])
+            self._apply_stars(api["counts"], "api", True, note)
             return
 
         # 3) 星级筛选→分页总数（v1.3.8 新增，最可靠）
