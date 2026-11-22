@@ -721,7 +721,7 @@ class App(object):
         helpm.add_command(label="使用说明", command=self.do_help)
         m.add_cascade(label="帮助", menu=helpm)
 
-        # 点窗口 X 只最小化到任务栏，真正退出走这里（状态栏也有同名入口）
+        # 点窗口 X 只是躲到右下角托盘，真正退出走这里（状态栏也有同名入口）
         m.add_separator()
         m.add_command(label="退出程序", command=self.do_quit)
         self.root.config(menu=m)
