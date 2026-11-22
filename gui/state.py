@@ -178,7 +178,10 @@ DEFAULT_SETTINGS = {
     "auto_result": "",         # 最近一次自动任务结果摘要（界面展示用）
     "auto_shop_date": {},      # {shop_id: YYYY-MM-DD} 每家店最近一次自动举报日期
                                # （新增店铺当天补跑也算，避免「一天只跑一次」漏店）
-    "close_tip_shown": False,  # 是否已提示过「点 X 只是最小化到任务栏」
+    "close_tip_shown": False,  # 是否已提示过「点 X 只是隐藏到托盘」
+    "close_action": "tray",    # 点窗口 X 的行为：tray=隐藏到右下角托盘 / taskbar=最小化到任务栏
+    "tray_tip_shown": False,   # 是否已提示过「图标在右下角托盘」
+    "lock_pin_sha": "",        # 锁定密码的 SHA256（空 = 未设置，锁定功能不可用）
 }
 
 

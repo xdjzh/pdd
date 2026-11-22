@@ -55,7 +55,7 @@ jobs:
             'run_gui.py', 'updater.py', 'app.ico', 'version_info.txt', 'cloud_config.json',
             'gui\__init__.py', 'gui\state.py', 'gui\adapter.py', 'gui\engine.py',
             'gui\app.py', 'gui\theme.py', 'gui\license.py', 'gui\login_window.py',
-            'gui\autostart.py', 'scripts\report_reviews.py'
+            'gui\autostart.py', 'gui\tray.py', 'scripts\report_reviews.py'
           )
           $miss = @($need | Where-Object { -not (Test-Path $_) })
           if ($miss.Count) { throw "Missing required files: $($miss -join ', ')" }
@@ -86,7 +86,7 @@ jobs:
             --version-file version_info.txt `
             --distpath dist --workpath build --specpath . `
             --collect-all playwright --collect-all pyee --collect-all greenlet `
-            --hidden-import=gui.license --hidden-import=gui.login_window --hidden-import=gui.autostart --hidden-import=updater `
+            --hidden-import=gui.license --hidden-import=gui.login_window --hidden-import=gui.autostart --hidden-import=gui.tray --hidden-import=updater `
             --add-data 'scripts;scripts' @extra run_gui.py
 
       - name: Verify EXE exists

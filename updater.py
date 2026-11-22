@@ -30,7 +30,8 @@ REQUIRED = (
     "manifest.json",
     "gui/__init__.py", "gui/app.py", "gui/state.py", "gui/theme.py",
     "gui/license.py", "gui/login_window.py", "gui/adapter.py",
-    "gui/engine.py", "gui/autostart.py", "scripts/report_reviews.py",
+    "gui/engine.py", "gui/autostart.py", "gui/tray.py",
+    "scripts/report_reviews.py",
 )
 MAX_ZIP = 2 * 1024 * 1024          # 压缩包上限 2MB
 MAX_UNPACKED = 6 * 1024 * 1024    # 解压后上限 6MB

@@ -13,6 +13,7 @@ tkinter 主界面 · 2026 潮流工作台视觉（浅色 Aurora / 深色 Midnigh
 
 本次改版只动视觉层；所有举报命令、定时任务、店铺隔离逻辑一行未改。
 """
+import hashlib
 import os
 import re
 import subprocess
@@ -178,15 +179,21 @@ class App(object):
         # 启动那一刻真正跑起来的版本（下载完补丁后也不会误显示成新版）
         self._running_ver = _ver_state()
         self._checking_update = False
+        # 右下角托盘图标（纯 ctypes 实现）；起不来会自动退回「最小化到任务栏」
+        self._tray = None
+        self._locked = False
+        self._tray_tip_at = 0.0
+        self._tray_polling = False
         self._build_ui()
+        self._init_tray()
         self.engine.start()
         if not self._tick_started:
             self._tick_started = True
             self.root.after(400, self._tick)
-        # 开机自启时最小化到任务栏：不打扰用户，但仍可随时点开看自动任务进度
+        # 开机自启时直接收到右下角托盘：不打扰用户，点托盘图标即可打开
         if getattr(self, "start_minimized", False):
             try:
-                self.root.after(300, lambda: self.minimize_to_taskbar(notify=False))
+                self.root.after(500, lambda: self.hide_to_tray(notify=False))
             except Exception:
                 pass
         # 启动后静默检查一次；刚装过热更新或云端有新版都会主动弹窗告知
@@ -255,7 +262,17 @@ class App(object):
         ver_label.pack(side=tk.RIGHT, padx=(0, 14))
         ver_label.bind("<Button-1>", lambda e: self.do_version_info())
 
-        # 状态栏「退出程序」：点 X 只是最小化，真退出走这里（也可用菜单栏同名项）
+        # 状态栏「锁定」「退出程序」：点 X 只是躲到右下角托盘，真退出走这里
+        self.lock_label = tk.Label(status, text="锁定", bg=t["bg"],
+                                   fg=t["muted"], cursor="hand2",
+                                   font=(self.fam, self.fs["xs"]))
+        self.lock_label.pack(side=tk.RIGHT, padx=(0, 14))
+        self.lock_label.bind("<Button-1>", lambda e: self.lock_app())
+        self.lock_label.bind("<Enter>",
+                             lambda e: self.lock_label.configure(fg=t["accent"]))
+        self.lock_label.bind("<Leave>",
+                             lambda e: self.lock_label.configure(fg=t["muted"]))
+
         self.quit_label = tk.Label(status, text="退出程序", bg=t["bg"],
                                    fg=t["muted"], cursor="hand2",
                                    font=(self.fam, self.fs["xs"]))
@@ -689,6 +706,14 @@ class App(object):
         acc.add_command(label="退出登录（重启后重新登录）", command=self.do_logout)
         m.add_cascade(label="账号", menu=acc)
 
+        setting = self._menu(m)
+        setting.add_command(label="打开设置窗口…", command=self.do_settings)
+        setting.add_separator()
+        setting.add_command(label="隐藏到右下角托盘",
+                            command=lambda: self.hide_to_tray(notify=False))
+        setting.add_command(label="锁定软件（需密码解锁）", command=self.lock_app)
+        m.add_cascade(label="设置", menu=setting)
+
         helpm = self._menu(m)
         helpm.add_command(label="检查更新", command=self.do_check_update)
         helpm.add_command(label="版本信息", command=self.do_version_info)
@@ -713,11 +738,35 @@ class App(object):
         self.popup.add_command(label="删除店铺", command=self.do_remove)
 
     # ---------- 定时刷新 ----------
+    def _visible(self):
+        """窗口是否正显示着（隐藏到托盘 / 最小化时为 False）。"""
+        try:
+            return self.root.state() not in ("withdrawn", "iconic")
+        except Exception:
+            return True
+
+    def _toast(self, title, text):
+        """窗口不可见时的提醒：只发托盘气泡 + 状态栏，绝不弹模态框
+        （父窗口隐藏时弹框会卡住 Tk 事件循环，界面看起来就死掉了）。"""
+        try:
+            self.status_var.set("%s：%s" % (title, str(text).split("\n")[0]))
+        except Exception:
+            pass
+        if self._tray:
+            try:
+                self._tray.notify(title, text)
+            except Exception:
+                pass
+
     def _tick(self):
         if self._closing:
             return
         try:
             self._render()
+            now = time.time()
+            if now - self._tray_tip_at > 5:
+                self._tray_tip_at = now
+                self._update_tray_tip()
             if self.license_session and not self._license_checking and \
                     time.time() - self._last_license_check > 900:
                 self._last_license_check = time.time()
@@ -732,13 +781,15 @@ class App(object):
                     continue
                 if ev[0] == "daily_limit":
                     _, sid, name, reported = ev
-                    messagebox.showwarning(
-                        "已到达当日举报上限",
-                        "店铺：%s\n\n平台已触发风控，本店铺已自动暂停。\n"
-                        "本次已举报 %d 条。\n\n"
-                        "明天额度恢复后，直接打开本程序点「开始举报」即可继续，"
-                        "登录态会一直保持在线。" % (name, reported),
-                        parent=self.root)
+                    title = "已到达当日举报上限"
+                    text = ("店铺：%s\n\n平台已触发风控，本店铺已自动暂停。\n"
+                            "本次已举报 %d 条。\n\n"
+                            "明天额度恢复后点「开始举报」即可继续，"
+                            "登录态会一直保持在线。" % (name, reported))
+                    if self._locked or not self._visible():
+                        self._toast(title, text)
+                    else:
+                        messagebox.showwarning(title, text, parent=self.root)
         except Exception:
             pass
         self.root.after(800, self._tick)
@@ -1018,9 +1069,13 @@ class App(object):
                 else:
                     self._license_blocked = True
                     self.status_var.set("授权已失效：%s" % msg)
-                    messagebox.showerror("授权已失效",
-                                         "%s\n\n请重启软件重新登录。" % msg,
-                                         parent=self.root)
+                    if self._locked or not self._visible():
+                        self._toast("授权已失效", "%s\n\n请重启软件重新登录。"
+                                    % msg)
+                    else:
+                        messagebox.showerror("授权已失效",
+                                             "%s\n\n请重启软件重新登录。" % msg,
+                                             parent=self.root)
             try:
                 self.root.after(0, done)
             except Exception:
@@ -1104,6 +1159,26 @@ class App(object):
         label = ((r.get("label") or "").strip() or
                  ("版本 " + str(r.get("version") or "")))
         changelog = (r.get("changelog") or "").strip()
+
+        if (self._locked or not self._visible()) and not manual:
+            # 藏在托盘/锁定时不弹模态框（父窗口不可见会卡住界面），
+            # 改成状态栏 + 托盘气泡，用户点开主界面时再问也不迟。
+            if out["downloaded"] and out["downloaded"] > cur["version"]:
+                self._toast("更新已下载",
+                            "新版 %s 已就绪，关闭重开软件即生效。" % label)
+            elif out["error"]:
+                try:
+                    self.status_var.set("检查更新失败：%s" % out["error"][:60])
+                except Exception:
+                    pass
+            elif r.get("hasUpdate"):
+                self._toast("发现新版本 %s" % label,
+                            "下载未完成，关闭重开软件会自动重试。")
+            elif (cur["patched"] and cur["appliedAt"]
+                    and time.time() - cur["appliedAt"] < 300):
+                self._toast("已自动更新",
+                            "本次启动已加载 %s" % (cur["label"] or "最新版"))
+            return
 
         if out["downloaded"] and out["downloaded"] > cur["version"]:
             messagebox.showinfo(
@@ -1359,16 +1434,501 @@ class App(object):
             "8. 1/2/3 星数量按「接口统计 → 星级标签 → 逐页统计评价卡片 → 筛选分页」"
             "四级读取；读不到时显示「—」（不是 0 条），并可右键「上报页面诊断」，"
             "程序会自动把真实页面结构回传给开发者，无需你手动传文件。\n"
-            "9. 点窗口右上角 X 只是最小化到任务栏，程序继续在后台续期登录、"
-            "跑自动任务；要彻底关闭，请点状态栏或菜单栏的「退出程序」。\n"
+            "9. 点窗口右上角 X 会隐藏到右下角托盘（任务栏不留按钮），程序继续"
+            "后台续期登录、跑自动任务；左键点托盘图标打开主界面，右键可锁定、"
+            "设置、检测版本、退出；想改回最小化到任务栏，在「设置」里切换。\n"
             "10. 自动任务按「每家店铺 / 每天一次」记录：当天新增的店铺，"
             "扫码登录成功后会自动补跑一次举报，不会因为「今天已经跑过」等到明天。\n\n"
             "数据目录：程序同级的 pdd_data 文件夹（可整包拷贝备份）。",
             parent=self.root)
 
+    # ---------- 右下角托盘 ----------
+    def _tray_log(self, msg):
+        """托盘相关异常写进 pdd_data/tray.log，出问题能查。"""
+        try:
+            path = os.path.join(self.store.root, "tray.log")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        except Exception:
+            pass
+
+    def _init_tray(self, retry=1):
+        """启动右下角托盘图标；失败就静默退回任务栏方案，不影响主功能。"""
+        if self._tray and self._tray.is_running():
+            return
+        try:
+            from . import tray as tray_mod
+        except Exception as e:
+            self._tray_log("导入托盘模块失败：%s" % e)
+            return
+        try:
+            if self._tray is None:
+                self._tray = tray_mod.TrayIcon(
+                    title="PDD 工作台 · 差评举报",
+                    icon_path=os.path.join(app_base_dir(), "app.ico"),
+                    log=self._tray_log)
+            if not self._tray.start():
+                self._tray = None
+                if retry > 0:
+                    # 开机自启时资源管理器可能还没就绪，8 秒后再试一次
+                    self._tray_log("托盘首次启动失败，8 秒后重试")
+                    try:
+                        self.root.after(8000,
+                                        lambda: self._init_tray(retry - 1))
+                    except Exception:
+                        pass
+                return
+            self._update_tray_tip()
+            if not self._tray_polling:
+                self._tray_polling = True
+                self.root.after(150, self._poll_tray)
+        except Exception as e:
+            self._tray = None
+            self._tray_log("托盘初始化异常：%s" % e)
+
+    def _poll_tray(self):
+        """在 Tk 线程里取托盘事件（绝不在托盘线程里操作 tkinter）。"""
+        if self._closing:
+            return
+        try:
+            if self._tray:
+                for ev in self._tray.pop_events():
+                    self._on_tray_event(ev)
+        except Exception as e:
+            self._tray_log("处理托盘事件失败：%s" % e)
+        try:
+            self.root.after(150, self._poll_tray)
+        except Exception:
+            self._tray_polling = False
+
+    def _on_tray_event(self, ev):
+        if ev == "open":
+            self.show_main()
+        elif ev == "lock":
+            self.lock_app()
+        elif ev == "unlock":
+            self._unlock_dialog()
+        elif ev == "settings":
+            self.do_settings()
+        elif ev == "update":
+            if self.show_main():
+                self.do_check_update()
+        elif ev == "quit":
+            self.do_quit()
+
+    def _update_tray_tip(self):
+        if not self._tray:
+            return
+        try:
+            if self._locked:
+                tip = "PDD 工作台 · 已锁定（右键可解锁）"
+            else:
+                states = self.engine.snapshot()
+                online = sum(1 for st in states.values() if st.get("online"))
+                pending = 0
+                for st in states.values():
+                    if st.get("stars_ok", False):
+                        for k in ("star1", "star2", "star3"):
+                            pending += self._as_int(st.get(k))
+                tip = "PDD 工作台 · %d 家在线 · 待举报 %d 条" % (online, pending)
+            self._tray.set_locked(self._locked)
+            self._tray.set_tip(tip)
+        except Exception:
+            pass
+
+    # ---------- 显示 / 隐藏 / 锁定 ----------
+    def show_main(self):
+        """从托盘唤起主界面；锁定时先要密码。返回 True=已显示。"""
+        if self._locked and not self._unlock_dialog(open_window=False):
+            return False
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+            self.root.attributes("-topmost", True)
+            self.root.after(400, self._drop_topmost)
+        except Exception:
+            pass
+        self._update_tray_tip()
+        return True
+
+    def _drop_topmost(self):
+        try:
+            self.root.attributes("-topmost", False)
+        except Exception:
+            pass
+
+    def hide_to_tray(self, notify=True):
+        """隐藏到右下角托盘：任务栏不留按钮，后台继续续期登录、跑自动任务。"""
+        if not (self._tray and self._tray.is_running()):
+            # 托盘没起来就退回最小化到任务栏，绝不会把窗口弄丢
+            self.minimize_to_taskbar(notify=notify)
+            return
+        first = notify and not self.settings.get("tray_tip_shown")
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        if first:
+            try:
+                self.settings.set("tray_tip_shown", True)
+                self._tray.notify(
+                    "程序已隐藏到右下角",
+                    "图标在右下角通知区域（时钟旁边）。\n"
+                    "左键单击打开主界面，右键可锁定、设置、检测版本、退出。")
+            except Exception:
+                pass
+        try:
+            self.status_var.set("已隐藏到右下角托盘 · 左键点图标打开，右键看菜单")
+        except Exception:
+            pass
+        self._update_tray_tip()
+
+    @staticmethod
+    def _sha(text):
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+    def lock_app(self):
+        """锁定：窗口立即隐藏，重新打开必须输密码。"""
+        if not (self._tray and self._tray.is_running()):
+            messagebox.showinfo(
+                "锁定", "托盘图标没有启动，暂时无法锁定。\n"
+                "重启软件后即可使用（托盘不可用时会自动改为最小化到任务栏）。",
+                parent=self.root)
+            return
+        if not self.settings.get("lock_pin_sha"):
+            if not self._pin_dialog(
+                    mode="set", title="先设置解锁密码",
+                    subtitle="锁定后打开主界面要输这个密码（至少 4 位）"):
+                return
+        self._locked = True
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        self._update_tray_tip()
+        try:
+            self.status_var.set("已锁定 · 点托盘图标输密码解锁")
+            self._tray.notify("已锁定", "窗口已隐藏，需要密码才能重新打开。")
+        except Exception:
+            pass
+
+    def _unlock_dialog(self, open_window=True):
+        """弹出解锁密码框；成功返回 True。"""
+        if not self._locked:
+            return True
+        if not self.settings.get("lock_pin_sha"):
+            self._locked = False
+            return True
+        if not self._pin_dialog(mode="verify", title="已锁定",
+                                subtitle="输入解锁密码后打开主界面"):
+            return False
+        self._locked = False
+        self._update_tray_tip()
+        try:
+            self.status_var.set("已解锁")
+        except Exception:
+            pass
+        if open_window:
+            self.show_main()
+        return True
+
+    def _pin_dialog(self, mode="verify", title="已锁定", subtitle=""):
+        """密码框：verify=校验解锁密码，set=设置/修改密码。返回 True=成功。"""
+        t = self.t
+        mode = "set" if mode == "set" else "verify"
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.configure(bg=t["card"])
+        dlg.resizable(False, False)
+        wd = 430
+        ht = 330 if mode == "set" else 272
+        try:
+            dlg.geometry("%dx%d+%d+%d" % (
+                wd, ht,
+                max(0, (dlg.winfo_screenwidth() - wd) // 2),
+                max(0, (dlg.winfo_screenheight() - ht) // 3)))
+            dlg.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        tk.Label(dlg, text=title, bg=t["card"], fg=t["text"],
+                 font=(self.fam, self.fs["lg"], "bold")).pack(
+            anchor="w", padx=24, pady=(18, 2))
+        if subtitle:
+            tk.Label(dlg, text=subtitle, bg=t["card"], fg=t["muted"],
+                     font=(self.fam, self.fs["sm"]), wraplength=wd - 48,
+                     justify="left").pack(anchor="w", padx=24)
+
+        def make_entry():
+            e = tk.Entry(dlg, show="*", bg=t["card_alt"], fg=t["text"],
+                         insertbackground=t["text"], relief="flat", bd=0,
+                         font=(self.fam, self.fs["md"]), highlightthickness=1,
+                         highlightbackground=t["border"],
+                         highlightcolor=t["accent"])
+            e.pack(fill=tk.X, padx=24, pady=(10, 4), ipady=7)
+            return e
+
+        e1 = make_entry()
+        e2 = make_entry() if mode == "set" else None
+        msg = tk.Label(dlg, text="", bg=t["card"], fg=t["danger"],
+                       font=(self.fam, self.fs["sm"]), wraplength=wd - 48,
+                       justify="left")
+        msg.pack(anchor="w", padx=24, pady=(2, 0))
+
+        result = {"ok": False}
+
+        def close():
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        def submit(_event=None):
+            val = e1.get()
+            if mode == "set":
+                if len(val) < 4:
+                    msg.config(text="密码至少 4 位")
+                    return
+                if e2 is not None and val != e2.get():
+                    msg.config(text="两次输入不一致，请重新输入")
+                    e2.delete(0, tk.END)
+                    e2.focus_set()
+                    return
+                self.settings.set("lock_pin_sha", App._sha(val))
+                result["ok"] = True
+                close()
+                return
+            if App._sha(val) == str(self.settings.get("lock_pin_sha") or ""):
+                result["ok"] = True
+                close()
+            else:
+                msg.config(text="密码不正确；忘了可以右键托盘「退出程序」，"
+                                "重新打开时用账号密码登录")
+                e1.delete(0, tk.END)
+                e1.focus_set()
+
+        def button(text, cmd, primary=False):
+            return tk.Button(
+                dlg, text=text, command=cmd,
+                bg=t["accent"] if primary else t["card_alt"],
+                fg=t["accent_fg"] if primary else t["text_2"],
+                activebackground=(t["accent_hover"] if primary
+                                  else t["accent_soft"]),
+                activeforeground=(t["accent_fg"] if primary else t["accent"]),
+                relief="flat", bd=0, font=(self.fam, self.fs["md"]),
+                padx=18, pady=6, cursor="hand2")
+
+        row = tk.Frame(dlg, bg=t["card"])
+        row.pack(side=tk.BOTTOM, fill=tk.X, padx=24, pady=14)
+        button("取消", close).pack(side=tk.RIGHT)
+        tk.Frame(row, bg=t["card"], width=8).pack(side=tk.RIGHT)
+        button("确定", submit, True).pack(side=tk.RIGHT)
+
+        for widget in (e1, e2):
+            if widget is not None:
+                widget.bind("<Return>", submit)
+        dlg.bind("<Escape>", lambda e: close())
+        dlg.protocol("WM_DELETE_WINDOW", close)
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        e1.focus_set()
+        try:
+            dlg.wait_window(dlg)
+        except Exception:
+            pass
+        return bool(result["ok"])
+
+    # ---------- 设置窗口 ----------
+    def _mk_link(self, parent, text, command):
+        t = self.t
+        lb = tk.Label(parent, text=text, bg=parent["bg"], fg=t["accent"],
+                      font=(self.fam, self.fs["sm"]), cursor="hand2")
+        lb.bind("<Button-1>", lambda e: command())
+        lb.bind("<Enter>", lambda e: lb.config(fg=t["accent_hover"]))
+        lb.bind("<Leave>", lambda e: lb.config(fg=t["accent"]))
+        return lb
+
+    def do_settings(self):
+        if self._locked and not self.show_main():
+            return
+        t = self.t
+        win = getattr(self, "_settings_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+                return
+        except Exception:
+            pass
+        win = tk.Toplevel(self.root)
+        self._settings_win = win
+        win.title("设置")
+        win.configure(bg=t["card"])
+        win.resizable(False, False)
+        wd, ht = 470, 500
+        try:
+            win.geometry("%dx%d+%d+%d" % (
+                wd, ht,
+                max(0, (win.winfo_screenwidth() - wd) // 2),
+                max(0, (win.winfo_screenheight() - ht) // 3)))
+        except Exception:
+            pass
+
+        tk.Label(win, text="设置", bg=t["card"], fg=t["text"],
+                 font=(self.fam, self.fs["xl"], "bold")).pack(
+            anchor="w", padx=24, pady=(18, 0))
+        tk.Label(win, text="改完立即生效，保存在 pdd_data/settings.json",
+                 bg=t["card"], fg=t["muted"],
+                 font=(self.fam, self.fs["sm"])).pack(anchor="w", padx=24)
+
+        box = tk.Frame(win, bg=t["card"])
+        box.pack(fill=tk.BOTH, expand=True, padx=24, pady=(12, 0))
+
+        def section(text):
+            tk.Label(box, text=text, bg=t["card"], fg=t["text_2"],
+                     font=(self.fam, self.fs["sm"], "bold")).pack(
+                anchor="w", pady=(10, 2))
+
+        # 1) 关闭窗口行为
+        section("点窗口右上角 X 时")
+        self._close_var = tk.StringVar(
+            value=str(self.settings.get("close_action") or "tray"))
+        for val, label in (("tray", "隐藏到右下角托盘（推荐，任务栏不留按钮）"),
+                           ("taskbar", "最小化到任务栏（任务栏保留按钮）")):
+            tk.Radiobutton(box, text=label, value=val,
+                           variable=self._close_var,
+                           command=self._on_close_action,
+                           bg=t["card"], fg=t["text"], selectcolor=t["card"],
+                           activebackground=t["card"],
+                           activeforeground=t["accent"], bd=0,
+                           highlightthickness=0, anchor="w",
+                           font=(self.fam, self.fs["md"])).pack(fill=tk.X)
+
+        # 2) 自动任务与开机自启
+        section("自动运行")
+        self._s_auto = tk.BooleanVar(value=bool(self.settings.get("auto_task")))
+        self._s_boot = tk.BooleanVar(value=autostart.is_enabled())
+        for var, label, cmd in (
+                (self._s_auto, "启用自动任务（每天自动登录并举报到店铺上限）",
+                 self._on_settings_auto),
+                (self._s_boot, "开机自动启动本软件（启动后直接收到托盘）",
+                 self._on_settings_boot)):
+            tk.Checkbutton(box, text=label, variable=var, command=cmd,
+                           bg=t["card"], fg=t["text"], selectcolor=t["card"],
+                           activebackground=t["card"],
+                           activeforeground=t["accent"], bd=0,
+                           highlightthickness=0, anchor="w",
+                           font=(self.fam, self.fs["md"])).pack(fill=tk.X)
+
+        # 3) 锁定
+        section("锁定（窗口隐藏，重新打开要输密码）")
+        lockrow = tk.Frame(box, bg=t["card"])
+        lockrow.pack(fill=tk.X)
+        self._pin_state_var = tk.StringVar(
+            value="已设置密码" if self.settings.get("lock_pin_sha") else "未设置密码")
+        tk.Label(lockrow, textvariable=self._pin_state_var, bg=t["card"],
+                 fg=t["muted"], font=(self.fam, self.fs["sm"])).pack(side=tk.LEFT)
+        self._mk_link(lockrow, "清除密码", self._settings_clear_pin).pack(
+            side=tk.RIGHT)
+        tk.Label(lockrow, text="  |  ", bg=t["card"], fg=t["border"]).pack(
+            side=tk.RIGHT)
+        self._mk_link(lockrow, "设置/修改密码", self._settings_set_pin).pack(
+            side=tk.RIGHT)
+
+        # 4) 常用操作
+        section("常用操作")
+        tools = tk.Frame(box, bg=t["card"])
+        tools.pack(fill=tk.X)
+
+        def tool_btn(text, cmd):
+            b = tk.Button(tools, text=text, command=cmd, bg=t["card_alt"],
+                          fg=t["text_2"], activebackground=t["accent_soft"],
+                          activeforeground=t["accent"], relief="flat", bd=0,
+                          font=(self.fam, self.fs["sm"]), padx=12, pady=5,
+                          cursor="hand2")
+            b.pack(side=tk.LEFT, padx=(0, 8))
+            return b
+
+        tool_btn("清除当日上限标记", self.do_clear_limit)
+        tool_btn("刷新 1/2/3 星", self.do_refresh)
+        tool_btn("使用说明", self.do_help)
+
+        # 5) 底部
+        foot = tk.Frame(win, bg=t["card"])
+        foot.pack(fill=tk.X, padx=24, pady=(12, 16))
+        tk.Button(foot, text="关闭", command=win.destroy,
+                  bg=t["accent"], fg=t["accent_fg"],
+                  activebackground=t["accent_hover"],
+                  activeforeground=t["accent_fg"], relief="flat", bd=0,
+                  font=(self.fam, self.fs["md"]), padx=20, pady=6,
+                  cursor="hand2").pack(side=tk.RIGHT)
+        self._mk_link(foot, "检测版本", self.do_check_update).pack(
+            side=tk.LEFT, pady=8)
+
+    def _on_close_action(self):
+        val = self._close_var.get()
+        self.settings.set("close_action", val)
+        try:
+            self.status_var.set("点 X 时：%s" % (
+                "隐藏到右下角托盘" if val == "tray" else "最小化到任务栏"))
+        except Exception:
+            pass
+
+    def _on_settings_auto(self):
+        want = bool(self._s_auto.get())
+        if want != bool(self.settings.get("auto_task")):
+            self.toggle_auto_task()
+        try:
+            self._s_auto.set(bool(self.settings.get("auto_task")))
+        except Exception:
+            pass
+
+    def _on_settings_boot(self):
+        want = bool(self._s_boot.get())
+        if want != autostart.is_enabled():
+            self.toggle_auto_startup()
+        try:
+            self._s_boot.set(autostart.is_enabled())
+        except Exception:
+            pass
+
+    def _settings_set_pin(self):
+        if self._pin_dialog(mode="set", title="设置解锁密码",
+                            subtitle="锁定后打开主界面要输这个密码（至少 4 位）"):
+            try:
+                self._pin_state_var.set("已设置密码")
+                self.status_var.set("解锁密码已设置")
+            except Exception:
+                pass
+
+    def _settings_clear_pin(self):
+        if not self.settings.get("lock_pin_sha"):
+            messagebox.showinfo("清除密码", "当前没有设置锁定密码。",
+                                parent=self.root)
+            return
+        if not messagebox.askyesno("清除密码",
+                                   "清除后「锁定」功能不可用，确定吗？",
+                                   parent=self.root):
+            return
+        self.settings.set("lock_pin_sha", "")
+        self._locked = False
+        try:
+            self._pin_state_var.set("未设置密码")
+        except Exception:
+            pass
+        self._update_tray_tip()
+
     # ---------- 关闭 / 最小化 ----------
     def minimize_to_taskbar(self, notify=False):
-        """把窗口收到任务栏，程序继续在后台跑（登录续期、自动任务都不中断）。"""
+        """最小化到任务栏（托盘不可用时兜底，也可在设置里主动选）。"""
         visible = True
         try:
             visible = self.root.state() != "iconic"
@@ -1400,39 +1960,53 @@ class App(object):
                                 "退出请点右下角「退出程序」")
         except Exception:
             pass
+        self._update_tray_tip()
 
     def on_close(self):
-        """点窗口右上角 X：默认最小化到任务栏，不退出程序。"""
+        """点窗口右上角 X：默认隐藏到右下角托盘，不退出程序。"""
         if self._closing:
             try:
                 self.root.destroy()
             except Exception:
                 pass
             return
-        self.minimize_to_taskbar(notify=True)
+        action = str(self.settings.get("close_action") or "tray")
+        if action == "taskbar":
+            self.minimize_to_taskbar(notify=True)
+        else:
+            self.hide_to_tray(notify=True)
 
-    def do_quit(self):
-        """真正退出程序（菜单 / 状态栏入口）。"""
-        try:
-            self.root.deiconify()        # 弹确认框前先把窗口还原，避免藏起来
-        except Exception:
-            pass
-        if not messagebox.askokcancel("退出程序",
-                                     "确定退出吗？\n"
-                                     "运行中的举报任务会停止，登录态已保存。\n"
-                                     "（只想起到最小化的效果，点窗口右上角 X 即可）",
-                                     parent=self.root):
-            return
+    def do_quit(self, confirm=None):
+        """真正退出程序（菜单 / 状态栏 / 托盘右键）。"""
+        if confirm is None:
+            # 锁定时不弹确认框：窗口是隐藏的，弹框反而会把界面露出来
+            confirm = not self._locked
+        if confirm:
+            try:
+                self.root.deiconify()    # 弹确认框前先还原窗口
+            except Exception:
+                pass
+            if not messagebox.askokcancel(
+                    "退出程序",
+                    "确定退出吗？\n"
+                    "运行中的举报任务会停止，登录态已保存。\n"
+                    "（只想隐藏到托盘，点窗口右上角 X 即可）",
+                    parent=self.root):
+                return
         self._closing = True
         try:
             self.engine.shutdown()
         except Exception:
             pass
+        if self._tray:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
         try:
             self.root.destroy()
         except Exception:
             pass
-
 
 def main(license_session=None, minimized=False):
     store = ShopStore()
