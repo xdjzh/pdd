@@ -1451,7 +1451,7 @@ class ShopSession(object):
             pass
         return result
 
-    def _apply_stars(self, values, source, ok, note=""):
+    def _apply_stars(self, values, source, ok, note="", skip_ledger=False):
         # ★ 反复刷新保护：读不到可信数时【保留上一次可信读数】，不清零、不覆盖。
         #   旧实现把内部值清零 → 顶部合计闪成 0；再加上多次刷新状态互相踩，
         #   表现为「没动再查数字越来越多/忽大忽小」。只有明确读到可信数才更新。
@@ -1469,11 +1469,19 @@ class ShopSession(object):
         raw = {k: max(0, int(values.get(k, 0) or 0)) for k in (1, 2, 3)}
         # 平台返回的是全量评价数（含举报中/举报成功），界面只显示未举报的：
         # 统一在这里按台账扣除，顶部「待处理差评」合计与列表 1/2/3 星都会跟着变。
-        rep = self._reported_count_by_star() if ok else {1: 0, 2: 0, 3: 0}
-        self.stars_total = dict(raw)     # 平台原始总数，仅诊断/说明用
-        self.stars_reported = dict(rep)  # 本次已扣除的已举报数
-        for k in (1, 2, 3):
-            self.stars[k] = max(0, raw[k] - rep.get(k, 0))
+        # ★ v1.5.1：接口直读(api_reported)已用平台 reportResult 精确排除已举报，
+        #   raw 就是未举报数，绝不能再扣本地台账（台账是全店历史累计，口径不一致会把
+        #   当前这批差评误扣成 0，且每次刷新扣数变化 → 数字忽大忽小）。
+        if skip_ledger:
+            rep = {1: 0, 2: 0, 3: 0}
+            for k in (1, 2, 3):
+                self.stars[k] = raw[k]
+        else:
+            rep = self._reported_count_by_star() if ok else {1: 0, 2: 0, 3: 0}
+            for k in (1, 2, 3):
+                self.stars[k] = max(0, raw[k] - rep.get(k, 0))
+        self.stars_total = dict(raw)     # 展示口径的原始数（api_reported 时为未举报数）
+        self.stars_reported = dict(rep)  # 本次已扣除的已举报数（api_reported 时为0）
         self.stars_ok = bool(ok)
         self.stars_source = source if ok else "none"
         rep_total = sum(rep.values())
@@ -1482,11 +1490,13 @@ class ShopSession(object):
                 note, sum(raw.values()), rep_total)
         self.star_note = str(note)[:220]
         self.last_check = time.strftime("%H:%M:%S")
-        label = {"api": "评价接口", "tab": "星级标签",
+        label = {"api": "评价接口", "api_reported": "平台举报状态", "tab": "星级标签",
                  "cards": "逐页统计评价卡片", "pager": "筛选分页"}.get(source, source)
         if ok:
             msg = "未举报 1/2/3 星已更新（来源：%s）" % label
-            if rep_total:
+            if skip_ledger:
+                msg += "，已按平台举报状态排除已举报评价"
+            elif rep_total:
                 msg += "，已扣除已举报 %d 条" % rep_total
         else:
             msg = "未读到可信的评价数量，诊断已本地留档并自动回传；可点「刷新数量」重试"
@@ -1657,6 +1667,43 @@ class ShopSession(object):
                 return int(v)
         return None
 
+    @staticmethod
+    def _item_reported(item):
+        """用接口自带的 reportResult 判断一条评价是否已举报（平台官方状态）。
+
+        诊断证实 /saturn/reviews/list 每条评价带：
+          reportResult = {'desc': '未被举报', 'status': 99, 'clientDesc': '未被举报', ...}
+        拼多多启用 hitMallReportContradictoryReviewGray 新版举报逻辑后，该字段准确反映
+        「举报中/举报成功/未被举报」。用它比本地台账扣减可靠得多——台账是全店历史累计，
+        与"最近2000条"口径不一致，会把当前这批差评误扣成 0。
+
+        返回 True=已举报(举报中/成功)，False=未举报。字段缺失时保守返回 False（当作未
+        举报，宁可让用户看到后可举报，也不要漏掉真正待处理的差评）。
+        """
+        if not isinstance(item, dict):
+            return False
+        rr = item.get("reportResult")
+        if isinstance(rr, dict):
+            desc = str(rr.get("desc") or rr.get("clientDesc") or "")
+            st = rr.get("status")
+            # 明确的"未被举报"
+            if "未被举报" in desc or "未举报" in desc:
+                return False
+            # 明确的举报中/举报成功
+            if "举报" in desc and ("中" in desc or "成功" in desc or "已" in desc):
+                return True
+            # status: 99=未被举报（诊断样本）；其它常见已举报码 1/2/3/4/5
+            if st == 99:
+                return False
+            if isinstance(st, int) and st in (1, 2, 3, 4, 5, 6, 7, 8):
+                return True
+        # 兼容顶层字段
+        for key in ("reported", "isReported", "hasReported"):
+            v = item.get(key)
+            if isinstance(v, bool):
+                return v
+        return False
+
     async def count_stars_by_api(self, all_total=None):
         """直接调用评价列表接口，分页拉取评价、按 descScore 统计 1/2/3 星。
 
@@ -1740,7 +1787,8 @@ class ShopSession(object):
         # ★ v1.4.5：诊断证实 pageSize=100 会触发 errorCode 2000010「仅支持查看近2000条」，
         #   页面自身成功请求用的是 pageSize=10，必须回退到该值；可查看上限 2000 条 =
         #   200 页，max_pages 相应提到 205。
-        counts = {1: 0, 2: 0, 3: 0}
+        counts = {1: 0, 2: 0, 3: 0}          # 未举报（界面展示用）
+        counts_all = {1: 0, 2: 0, 3: 0}      # 全部（含已举报，诊断对照用）
         seen = set()
         page_no, page_size, max_pages = 1, 10, 205
         total_rows, show_cap, scanned = None, None, 0
@@ -1775,14 +1823,23 @@ class ShopSession(object):
                     seen.add(rid)
                 star = self._item_star(item)
                 if star in counts:
-                    counts[star] += 1
+                    counts_all[star] += 1
+                    # ★ v1.5.1：用平台 reportResult 精确排除已举报，不再靠本地台账盲扣。
+                    reported = self._item_reported(item)
+                    if not reported:
+                        counts[star] += 1
                     if star not in samples:
-                        samples[star] = str(item.get("comment") or "")[:40]
+                        rr = item.get("reportResult")
+                        samples[star] = "举报=%s/%s | %s" % (
+                            reported,
+                            (rr.get("desc") if isinstance(rr, dict) else None),
+                            str(item.get("comment") or "")[:30])
                 scanned += 1
                 page_new += 1
-            self._log_api("第%d页 size=%d 返回%d条 新增%d条 累计%d星分布=%s total=%s show=%s" % (
+            self._log_api("第%d页 size=%d 返回%d条 新增%d条 未举报=%s 全部=%s total=%s show=%s" % (
                 page_no, page_size, len(data), page_new, scanned,
-                [counts[s] for s in (1, 2, 3)], total_rows, show_cap))
+                [counts[s] for s in (1, 2, 3)],
+                [counts_all[s] for s in (1, 2, 3)], total_rows, show_cap))
             if page_new == 0:
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
@@ -1812,9 +1869,16 @@ class ShopSession(object):
             notes.append("仅扫 %d 条（上限 %s，覆盖 %s），样本不足不采信" % (
                 scanned, cap, ("%.0f%%" % (cov * 100)) if isinstance(cov, float) else "?"))
             return {"counts": None, "notes": notes}
-        notes.append("接口逐条统计 %d 条评价（%d 页，上限 %s）1/2/3星=%s" % (
-            scanned, page_no, cap, [counts[s] for s in (1, 2, 3)]))
-        return {"counts": counts, "notes": notes}
+        notes.append("接口逐条统计 %d 条评价（%d 页，上限 %s）未举报1/2/3星=%s 全部=%s" % (
+            scanned, page_no, cap, [counts[s] for s in (1, 2, 3)],
+            [counts_all[s] for s in (1, 2, 3)]))
+        # 样本明细写进日志（含平台 reportResult 状态），便于核验扣减是否正确
+        for st in (1, 2, 3):
+            if st in samples:
+                self._log_api("  %d星样本: %s" % (st, samples[st]))
+        # counts 已是"未举报"数；用 source=api_reported 标记，避免 _apply_stars 再扣台账
+        return {"counts": counts, "counts_all": counts_all,
+                "source": "api_reported", "notes": notes}
 
     def _log_api(self, text):
         self.api_call_log.append("%s %s" % (time.strftime("%H:%M:%S"), text))
@@ -2177,8 +2241,10 @@ class ShopSession(object):
             api = None
             self.set(message="接口星级统计异常：%s" % str(e)[:60])
         if api and api.get("counts"):
-            note = "评价接口按星级筛选：" + "，".join(api.get("notes") or [])
-            self._apply_stars(api["counts"], "api", True, note)
+            note = "平台举报状态精确统计：" + "，".join(api.get("notes") or [])
+            # api_reported 来源：counts 已按 reportResult 排除已举报，跳过本地台账扣减
+            self._apply_stars(api["counts"], api.get("source") or "api",
+                              True, note, skip_ledger=(api.get("source") == "api_reported"))
             return
 
         # 3) 星级筛选→分页总数（v1.3.8 新增，最可靠）
