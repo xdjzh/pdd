@@ -184,7 +184,7 @@ class App(object):
         # 开机自启时最小化到任务栏：不打扰用户，但仍可随时点开看自动任务进度
         if getattr(self, "start_minimized", False):
             try:
-                self.root.after(300, self.root.iconify)
+                self.root.after(300, lambda: self.minimize_to_taskbar(notify=False))
             except Exception:
                 pass
         # 启动后静默检查一次；刚装过热更新或云端有新版都会主动弹窗告知
@@ -252,6 +252,17 @@ class App(object):
                              font=(self.fam, self.fs["xs"]))
         ver_label.pack(side=tk.RIGHT, padx=(0, 14))
         ver_label.bind("<Button-1>", lambda e: self.do_version_info())
+
+        # 状态栏「退出程序」：点 X 只是最小化，真退出走这里（也可用菜单栏同名项）
+        self.quit_label = tk.Label(status, text="退出程序", bg=t["bg"],
+                                   fg=t["muted"], cursor="hand2",
+                                   font=(self.fam, self.fs["xs"]))
+        self.quit_label.pack(side=tk.RIGHT, padx=(0, 14))
+        self.quit_label.bind("<Button-1>", lambda e: self.do_quit())
+        self.quit_label.bind("<Enter>",
+                             lambda e: self.quit_label.configure(fg=t["danger"]))
+        self.quit_label.bind("<Leave>",
+                             lambda e: self.quit_label.configure(fg=t["muted"]))
 
         self.pages = {"report": self._build_report_page(self.content)}
         for key in ("dsr", "traffic", "profit"):
@@ -674,6 +685,10 @@ class App(object):
         helpm.add_separator()
         helpm.add_command(label="使用说明", command=self.do_help)
         m.add_cascade(label="帮助", menu=helpm)
+
+        # 点窗口 X 只最小化到任务栏，真正退出走这里（状态栏也有同名入口）
+        m.add_separator()
+        m.add_command(label="退出程序", command=self.do_quit)
         self.root.config(menu=m)
 
         self.popup = self._menu(self.root)
@@ -1251,13 +1266,62 @@ class App(object):
             "每次启动也会自动检查，装好新版会弹窗提示，重启即生效。\n"
             "8. 1/2/3 星数量按「接口统计 → 星级标签 → 逐页统计评价卡片 → 筛选分页」"
             "四级读取；读不到时显示「—」（不是 0 条），并可右键「上报页面诊断」，"
-            "程序会自动把真实页面结构回传给开发者，无需你手动传文件。\n\n"
+            "程序会自动把真实页面结构回传给开发者，无需你手动传文件。\n"
+            "9. 点窗口右上角 X 只是最小化到任务栏，程序继续在后台续期登录、"
+            "跑自动任务；要彻底关闭，请点状态栏或菜单栏的「退出程序」。\n\n"
             "数据目录：程序同级的 pdd_data 文件夹（可整包拷贝备份）。",
             parent=self.root)
 
+    # ---------- 关闭 / 最小化 ----------
+    def minimize_to_taskbar(self, notify=False):
+        """把窗口收到任务栏，程序继续在后台跑（登录续期、自动任务都不中断）。"""
+        if notify and not self.settings.get("close_tip_shown"):
+            try:
+                self.settings.set("close_tip_shown", True)
+                messagebox.showinfo(
+                    "已最小化到任务栏",
+                    "程序没有退出，正在后台继续运行：\n"
+                    "· 登录态每 2 分钟自动续期\n"
+                    "· 自动任务开启时会继续自动举报\n\n"
+                    "点任务栏图标即可重新打开窗口。\n"
+                    "要彻底关闭，请点窗口底部状态栏的「退出程序」，"
+                    "或菜单栏「退出程序」。",
+                    parent=self.root)
+            except Exception:
+                pass
+        try:
+            self.root.iconify()          # Windows：收到任务栏，图标仍在
+        except Exception:
+            try:
+                self.root.withdraw()     # 兜底：某些窗口管理器不支持 iconify
+            except Exception:
+                pass
+        try:
+            self.status_var.set("已最小化到任务栏，后台继续运行；"
+                                "退出请点右下角「退出程序」")
+        except Exception:
+            pass
+
     def on_close(self):
-        if not messagebox.askokcancel("退出", "确定退出吗？\n"
-                                     "运行中的举报任务会停止，登录态已保存。",
+        """点窗口右上角 X：默认最小化到任务栏，不退出程序。"""
+        if self._closing:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+            return
+        self.minimize_to_taskbar(notify=True)
+
+    def do_quit(self):
+        """真正退出程序（菜单 / 状态栏入口）。"""
+        try:
+            self.root.deiconify()        # 弹确认框前先把窗口还原，避免藏起来
+        except Exception:
+            pass
+        if not messagebox.askokcancel("退出程序",
+                                     "确定退出吗？\n"
+                                     "运行中的举报任务会停止，登录态已保存。\n"
+                                     "（只想起到最小化的效果，点窗口右上角 X 即可）",
                                      parent=self.root):
             return
         self._closing = True
@@ -1265,7 +1329,10 @@ class App(object):
             self.engine.shutdown()
         except Exception:
             pass
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
 
 def main(license_session=None, minimized=False):

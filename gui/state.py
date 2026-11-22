@@ -176,6 +176,7 @@ DEFAULT_SETTINGS = {
     "auto_startup": False,     # 开机自启（注册表 Run 项）
     "auto_date": "",           # 最近一次自动任务执行日期 YYYY-MM-DD（当天不重复）
     "auto_result": "",         # 最近一次自动任务结果摘要（界面展示用）
+    "close_tip_shown": False,  # 是否已提示过「点 X 只是最小化到任务栏」
 }
 
 
