@@ -1275,7 +1275,12 @@ class App(object):
     # ---------- 关闭 / 最小化 ----------
     def minimize_to_taskbar(self, notify=False):
         """把窗口收到任务栏，程序继续在后台跑（登录续期、自动任务都不中断）。"""
-        if notify and not self.settings.get("close_tip_shown"):
+        visible = True
+        try:
+            visible = self.root.state() != "iconic"
+        except Exception:
+            pass
+        if notify and visible and not self.settings.get("close_tip_shown"):
             try:
                 self.settings.set("close_tip_shown", True)
                 messagebox.showinfo(
