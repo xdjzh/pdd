@@ -1679,6 +1679,11 @@ class ShopSession(object):
 
         返回 True=已举报(举报中/成功)，False=未举报。字段缺失时保守返回 False（当作未
         举报，宁可让用户看到后可举报，也不要漏掉真正待处理的差评）。
+
+        ★ v1.5.5：按用户口径，「已处理」不只是举报中/成功，还包括
+        待审核、举报失败、经平台审核不符合举报要求、不计入店铺考核——这些都已
+        提交过或平台已处理，不该再算进待处理数。所以除了"未被举报"以外，凡是
+        desc 命中这些状态一律视为已处理。
         """
         if not isinstance(item, dict):
             return False
@@ -1686,16 +1691,18 @@ class ShopSession(object):
         if isinstance(rr, dict):
             desc = str(rr.get("desc") or rr.get("clientDesc") or "")
             st = rr.get("status")
-            # 明确的"未被举报"
+            # 明确的"未被举报"——唯一要计入待处理的
             if "未被举报" in desc or "未举报" in desc:
                 return False
-            # 明确的举报中/举报成功
-            if "举报" in desc and ("中" in desc or "成功" in desc or "已" in desc):
-                return True
-            # status: 99=未被举报（诊断样本）；其它常见已举报码 1/2/3/4/5
+            for kw in ("举报中", "待审核", "审核中", "审核通过", "举报成功",
+                       "已举报", "举报失败", "不符合", "不计入", "已处理",
+                       "处理中", "已生效", "已失效"):
+                if kw in desc:
+                    return True
+            # status: 99=未被举报（诊断样本）；其它码都当作已处理
             if st == 99:
                 return False
-            if isinstance(st, int) and st in (1, 2, 3, 4, 5, 6, 7, 8):
+            if isinstance(st, int) and 1 <= st <= 98:
                 return True
         # 兼容顶层字段
         for key in ("reported", "isReported", "hasReported"):
