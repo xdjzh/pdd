@@ -718,6 +718,8 @@ class App(object):
         helpm.add_command(label="检查更新", command=self.do_check_update)
         helpm.add_command(label="版本信息", command=self.do_version_info)
         helpm.add_separator()
+        helpm.add_command(label="浏览器自检（扫码窗口打不开时）",
+                          command=self.do_browser_check)
         helpm.add_command(label="使用说明", command=self.do_help)
         m.add_cascade(label="帮助", menu=helpm)
 
@@ -778,6 +780,37 @@ class App(object):
                         self.status_var.set(ev[1])
                     except Exception:
                         pass
+                    continue
+                if ev[0] == "login_failed":
+                    # 扫码窗口没弹出来：把真实原因摆到用户面前，别再只写一行状态栏
+                    _, sid, name, detail = ev
+                    self._browser_fail_detail = detail
+                    self.status_var.set("扫码窗口打不开：%s" % detail.split("\n")[0])
+                    if self._locked or not self._visible():
+                        self._toast("扫码窗口打不开", detail)
+                    else:
+                        messagebox.showerror(
+                            "扫码窗口打不开",
+                            "店铺：%s\n\n%s" % (name, detail),
+                            parent=self.root)
+                    continue
+                if ev[0] == "login_failed_path":
+                    _, sid, path = ev
+                    self.status_var.set("浏览器诊断已保存：%s" % path)
+                    try:
+                        self._browser_fail_path = path
+                    except Exception:
+                        pass
+                    continue
+                if ev[0] == "browser_report":
+                    _, text, path = ev
+                    if self._locked or not self._visible():
+                        self._toast("浏览器自检完成", "报告已保存：%s" % path)
+                    else:
+                        messagebox.showinfo(
+                            "浏览器自检完成",
+                            "%s\n\n报告已保存到：\n%s" % (text[-1200:], path),
+                            parent=self.root)
                     continue
                 if ev[0] == "daily_limit":
                     _, sid, name, reported = ev
@@ -966,8 +999,10 @@ class App(object):
         # new_shop=True：扫码成功后若自动任务开着，引擎会立刻给这家补跑一次举报
         self.engine.add_shop(shop, then="login", new_shop=True)
         self.status_var.set(
-            "已打开扫码登录窗口（默认二维码）· 扫码成功后自动获取店铺名并隐藏浏览器"
-            + ("· 自动任务已开，登录成功后将自动补跑举报" if self.settings.get("auto_task") else ""))
+            "正在打开扫码登录窗口（默认二维码）· 若 10 秒内没弹出来，"
+            "看错误提示或用菜单「帮助 → 浏览器自检」"
+            + ("· 自动任务已开，登录成功后将自动补跑举报"
+               if self.settings.get("auto_task") else ""))
 
     def do_rename(self):
         sid = self.selected()
@@ -1105,6 +1140,11 @@ class App(object):
 
     def do_check_update(self):
         self._check_update(manual=True)
+
+    def do_browser_check(self):
+        """浏览器自检：扫码窗口打不开时，一键生成明确原因（并保存到桌面）。"""
+        self.status_var.set("正在自检浏览器内核，请稍候…")
+        self.engine.call("browser_check")
 
     def _check_update(self, manual=False):
         """后台查云端；发现新版直接下载安装，下次启动生效。"""
@@ -1419,6 +1459,9 @@ class App(object):
             "使用说明",
             "1. 点「添加店铺」会直接打开扫码登录窗口（默认切到二维码），"
             "用商家版 APP 扫码即可；店铺名会自动从商家后台获取，不用手输。\n"
+            "   如果扫码窗口没弹出来：先看软件弹的错误框（会写明具体原因），"
+            "或点菜单「帮助 → 浏览器自检」生成桌面诊断文件；"
+            "新电脑常见原因是既没装 Chrome、Edge 又是老版，装个 Chrome 后重开即可。\n"
             "2. 登录成功后浏览器窗口自动关闭，店铺转为后台在线；"
             "如果没抓到店铺名，可右键「重命名」。\n"
             "3. 表格自动查 1/2/3 星评价数量，并定时续期登录态（每 2 分钟）。\n"

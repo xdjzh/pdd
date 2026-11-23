@@ -8,6 +8,8 @@ GUI（tkinter 主线程）只做两件事：
 所有 Playwright 操作都在后台线程里，界面不会卡。
 """
 import asyncio
+import glob
+import os
 import queue
 import sys
 import threading
@@ -20,6 +22,104 @@ from .state import blank_state
 HEARTBEAT_SECONDS = 120       # 在线心跳 / cookie 续期
 STAR_REFRESH_SECONDS = 600    # 1/2/3 星数量刷新（筛选较重，别太频繁）
 TICK_SECONDS = 3
+LAUNCH_TIMEOUT_MS = 25000     # 单次浏览器启动上限：不设的话杀软扫描会让 launch 永久挂住
+
+
+# ---------------------------------------------------------------------------
+# 浏览器定位：新装机器（尤其企业版 LTSC）常常既没 Chrome、Edge 又是老版，
+# 只能靠 exe 里内置的 Chromium。这里把所有可能的位置都找出来，逐个试。
+# ---------------------------------------------------------------------------
+def _short(e, limit=110):
+    s = str(e).replace("\n", " ").strip()
+    return s[:limit]
+
+
+def _win_app_paths(exe_name):
+    """从注册表 App Paths 读浏览器真实安装路径（比猜目录可靠）。"""
+    out = []
+    if sys.platform != "win32":
+        return out
+    try:
+        import winreg
+    except Exception:
+        return out
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\%s" % exe_name
+                with winreg.OpenKey(root, key, 0,
+                                    winreg.KEY_READ | view) as k:
+                    path = winreg.QueryValue(k, None)
+                if path and os.path.isfile(path):
+                    out.append(path)
+            except Exception:
+                continue
+    return out
+
+
+def installed_browsers():
+    """返回 [(说明, exe 路径)]，已存在的系统 Chrome / Edge。"""
+    if sys.platform != "win32":
+        return []
+    env = os.environ
+    cands = []
+    for name in ("chrome.exe", "msedge.exe"):
+        cands.extend(_win_app_paths(name))
+    roots = [env.get("PROGRAMFILES"), env.get("PROGRAMFILES(X86)"),
+             env.get("LOCALAPPDATA"), env.get("PROGRAMW6432")]
+    rel = {
+        "chrome.exe": (r"Google\Chrome\Application\chrome.exe",),
+        "msedge.exe": (r"Microsoft\Edge\Application\msedge.exe",),
+    }
+    for name, subs in rel.items():
+        for r in roots:
+            if not r:
+                continue
+            for sub in subs:
+                cands.append(os.path.join(r, sub))
+    seen, out = set(), []
+    for p in cands:
+        try:
+            if not p or not os.path.isfile(p):
+                continue
+            key = os.path.normcase(os.path.abspath(p))
+            if key in seen:
+                continue
+            seen.add(key)
+            tag = "系统 Chrome" if "chrome" in os.path.basename(p).lower() else "系统 Edge"
+            out.append((tag, p))
+        except Exception:
+            continue
+    return out
+
+
+def bundled_chromium():
+    """Playwright 内置 Chromium 的 chrome.exe 路径（打包后位于 _MEIPASS/ms-playwright）。"""
+    roots = []
+    env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env_path:
+        roots.append(env_path)
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        roots.append(os.path.join(meipass, "ms-playwright"))
+    try:
+        base = os.path.dirname(os.path.abspath(sys.executable))
+        roots.append(os.path.join(base, "ms-playwright"))
+        roots.append(os.path.join(base, "runtime", "ms-playwright"))
+    except Exception:
+        pass
+    if sys.platform != "win32":
+        return ""
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for pat in ("chromium-*/chrome-win/chrome.exe",
+                    "chromium-*/chrome-win64/chrome.exe",
+                    "chromium_headless_shell-*/chrome-win/chrome.exe"):
+            hits = sorted(glob.glob(os.path.join(root, pat)))
+            if hits:
+                return hits[-1]
+    return ""
 
 
 class Engine(object):
@@ -36,6 +136,8 @@ class Engine(object):
         self._thread = None
         self.playwright = None
         self.browser = None
+        self.browser_log = []          # 最近 40 条浏览器启动日志
+        self.browser_errors = []       # 最近一次启动失败的各候选原因
         self._browser_lock = None
         self._closed = False
         for shop in store.list():
@@ -266,24 +368,172 @@ class Engine(object):
         self.playwright = await async_playwright().start()
         return self.playwright
 
+    def _log_browser(self, text):
+        """浏览器启动日志：写内存（界面/诊断用）+ 落盘 pdd_data/browser.log。"""
+        line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
+        self.browser_log.append(line)
+        del self.browser_log[:-40]
+        try:
+            path = os.path.join(self.store.root, "browser.log")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    def _launch_attempts(self):
+        """按「成功率优先」排出的启动候选：系统 Chrome → Edge → 内置 Chromium。"""
+        out = [("系统 Chrome(channel)", {"channel": "chrome"}),
+               ("系统 Edge(channel)", {"channel": "msedge"})]
+        for label, path in installed_browsers():
+            out.append(("%s·指定路径" % label, {"executable_path": path}))
+        bundled = bundled_chromium()
+        if bundled:
+            out.append(("内置 Chromium", {"executable_path": bundled}))
+            out.append(("内置 Chromium·兼容模式",
+                        {"executable_path": bundled,
+                         "extra": ["--no-sandbox", "--disable-gpu",
+                                   "--disable-dev-shm-usage"]}))
+        return out
+
     async def launch_browser(self, headless=True):
-        """优先系统 Chrome / Edge，最后回退 Playwright 内置 Chromium。"""
+        """启动浏览器。逐个候选尝试，失败原因全部记下来，最后能说清为什么起不来。"""
         pw = await self._ensure_playwright()
         args = ["--disable-blink-features=AutomationControlled",
                 "--force-device-scale-factor=1"]
         if not headless:
-            args.append("--start-maximized")
-        for channel, label in (("chrome", "Chrome"), ("msedge", "Edge"),
-                               (None, "Chromium")):
+            # 可见窗口：最大化 + 给个屏幕内坐标，避免出现在屏幕外/被主窗口完全遮挡
+            args += ["--start-maximized", "--new-window",
+                     "--window-position=80,60"]
+        errors = []
+        for label, opt in self._launch_attempts():
+            kw = dict(opt)
+            extra = kw.pop("extra", None)
             try:
-                kw = {"headless": headless, "args": args}
-                if channel:
-                    kw["channel"] = channel
-                b = await pw.chromium.launch(**kw)
+                b = await pw.chromium.launch(
+                    headless=headless, args=args + list(extra or []),
+                    timeout=LAUNCH_TIMEOUT_MS, **kw)
+                self._log_browser("启动成功：%s（headless=%s）" % (label, headless))
                 return b
-            except Exception:
-                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                msg = "%s 失败：%s" % (label, _short(e))
+                errors.append(msg)
+                self._log_browser(msg)
+        self.browser_errors = errors
+        self._log_browser("全部 %d 种方式都没能启动浏览器" % len(errors))
         return None
+
+    def browser_failure_text(self):
+        """给用户看的启动失败说明（含每一种方式的具体报错）。"""
+        lines = ["这台电脑没能启动浏览器内核，所以扫码窗口弹不出来。", ""]
+        lines.append("已尝试 %d 种方式，全部失败：" % len(self.browser_errors))
+        for e in self.browser_errors[-6:]:
+            lines.append("  · " + e)
+        if not self.browser_errors:
+            lines.append("  · 没有找到任何浏览器候选（内置 Chromium 可能缺失）")
+        lines.append("")
+        lines.append("内置 Chromium 路径：%s" % (bundled_chromium() or "未找到"))
+        found = installed_browsers()
+        lines.append("系统浏览器：%s" % (
+            "、".join(label for label, _ in found) if found else "未检测到"))
+        lines.append("")
+        lines.append("建议：① 装一个 Google Chrome 后重开软件；"
+                     "② 或右键托盘「退出程序」再重开（杀软拦截后重试常能恢复）；"
+                     "③ 仍不行请把桌面上的浏览器诊断 txt 发给开发者。")
+        return "\n".join(lines)
+
+    async def diagnose_browsers(self):
+        """浏览器自检：把环境、路径、逐个候选的真实启动结果写成报告。"""
+        lines = []
+        A = lines.append
+        A("=" * 72)
+        A("PDD 工作台 · 浏览器启动自检")
+        A("时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        try:
+            import updater
+            ver = updater.version_info()
+            A("版本：%s  内核：%s" % (ver.get("label", "?"), ver.get("version", "?")))
+        except Exception:
+            pass
+        A("=" * 72)
+        A("")
+        A("【1. 运行环境】")
+        A("平台：%s   Python：%s" % (sys.platform, sys.version.split()[0]))
+        A("打包运行(frozen)：%s" % bool(getattr(sys, "frozen", False)))
+        A("_MEIPASS：%s" % (getattr(sys, "_MEIPASS", "") or "-"))
+        A("PLAYWRIGHT_BROWSERS_PATH：%s"
+          % (os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "(未设置)"))
+        A("")
+        A("【2. 浏览器来源】")
+        found = installed_browsers()
+        A("系统浏览器：%s" % ("；".join("%s=%s" % (l, p) for l, p in found)
+                          if found else "未检测到"))
+        bpath = bundled_chromium()
+        A("内置 Chromium：%s" % (bpath or "未找到"))
+        if bpath:
+            try:
+                A("  大小：%.1f MB" % (os.path.getsize(bpath) / 1048576.0))
+            except Exception as e:
+                A("  读取大小失败：%s" % _short(e))
+        A("")
+        A("【3. 逐个候选实测（无头模式，只验证能不能起来）】")
+        ok_any = False
+        fails = []
+        try:
+            pw = await self._ensure_playwright()
+        except Exception as e:
+            A("Playwright 初始化失败：%s" % _short(e))
+            pw = None
+        if pw is not None:
+            for label, opt in self._launch_attempts():
+                kw = dict(opt)
+                extra = kw.pop("extra", None)
+                t0 = time.time()
+                try:
+                    b = await pw.chromium.launch(
+                        headless=True, args=list(extra or []),
+                        timeout=LAUNCH_TIMEOUT_MS, **kw)
+                    A("  [OK] %s（%.1fs）" % (label, time.time() - t0))
+                    ok_any = True
+                    try:
+                        await b.close()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    line = "  [X ] %s（%.1fs）：%s" % (label, time.time() - t0,
+                                                   _short(e, 200))
+                    A(line)
+                    fails.append(line.strip().replace("[X ] ", ""))
+        if not ok_any and fails:
+            # 自检结果同步给启动失败说明，用户看到的两个地方口径一致
+            self.browser_errors = fails
+        A("")
+        A("结论：%s" % ("至少一种方式可用；若仍看不到窗口，多半是被挡在后台或被安全软件拦住"
+                     if ok_any else "所有方式都起不来 → 本机缺浏览器内核或被安全软件拦截"))
+        text = "\n".join(lines)
+        return text
+
+    def write_browser_report(self, text, tag="浏览器诊断"):
+        """把自检报告写到桌面，方便用户直接发过来。"""
+        try:
+            home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        except Exception:
+            home = os.path.expanduser("~")
+        path = os.path.join(home, "PDD诊断_%s_%s.txt" % (
+            tag, time.strftime("%Y%m%d_%H%M%S")))
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            return path
+        except Exception:
+            alt = os.path.join(self.store.root, "browser_report.txt")
+            try:
+                with open(alt, "w", encoding="utf-8") as f:
+                    f.write(text)
+                return alt
+            except Exception:
+                return ""
 
     async def get_browser(self):
         """所有店铺共享一个无头浏览器实例，彼此用独立 context 隔离 cookie。"""
@@ -379,9 +629,19 @@ class Engine(object):
 
     async def _dispatch(self, cmd, shop_id, kw):
         s = self.sessions.get(shop_id) if shop_id else None
-        if s is None and cmd not in ("noop",):
+        if s is None and cmd not in ("noop", "browser_check"):
             return
         try:
+            if cmd == "browser_check":
+                # 不依赖具体店铺，且不能被 s.busy() 挡住，所以放在最前面
+                try:
+                    text = await self.diagnose_browsers()
+                    path = self.write_browser_report(text)
+                except Exception as e:
+                    text = "自检本身出错：%s" % str(e)[:200]
+                    path = ""
+                self.emit("browser_report", text, path)
+                return
             if cmd == "stop":
                 # 停止不等队列，直接取消当前长任务
                 s.request_stop()
@@ -431,6 +691,8 @@ class Engine(object):
                     await s.write_desktop_diag(tag="手动诊断")
                 except Exception:
                     pass
+            elif cmd == "browser_check":
+                pass          # 已在最前面处理
             elif cmd == "start_report":
                 await s.run_exclusive(s.run_report(), kind="report")
             else:

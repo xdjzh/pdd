@@ -1007,18 +1007,50 @@ class ShopSession(object):
         否则自己就会被自己判定成「已有任务在运行」而立刻退出。
         """
         self.cancel_login = False
-        self.set("扫码中", "已打开登录窗口，请用拼多多商家版 APP 扫码", online=False)
+        self.set("扫码中", "正在打开登录窗口…", online=False)
         browser = None
         ctx = None
         try:
-            browser = await self.engine.launch_browser(headless=False)
+            try:
+                browser = await self.engine.launch_browser(headless=False)
+            except Exception as e:
+                browser = None
+                try:
+                    self.engine.browser_errors = ["启动异常：%s" % str(e)[:150]]
+                    self.engine._log_browser("启动异常：%s" % str(e)[:200])
+                except Exception:
+                    pass
             if browser is None:
-                self.set("登录失败", "没找到可用的 Chrome / Edge / Chromium")
+                # 别再只说一句「没找到浏览器」——把每种方式的真实报错弹到界面上，
+                # 同时把自检报告写到桌面，用户直接发过来就能定位。
+                detail = ""
+                try:
+                    detail = self.engine.browser_failure_text()
+                except Exception:
+                    detail = "没能启动浏览器内核"
+                self.set("登录失败", "扫码窗口打不开：%s" % detail.split("\n")[0])
+                try:
+                    self.engine.emit("login_failed", self.id, self.name, detail)
+                except Exception:
+                    pass
+                try:
+                    text = await self.engine.diagnose_browsers()
+                    path = self.engine.write_browser_report(text)
+                    if path:
+                        self.engine.emit("login_failed_path", self.id, path)
+                except Exception:
+                    pass
                 return False
             self._login_browser = browser
             ctx = await browser.new_context(no_viewport=True)
             page = await ctx.new_page()
             await page.goto(self.core.PDD_MMS_URL, wait_until="domcontentloaded")
+            # 浏览器窗口是另一个进程的窗口，可能被主界面压住/跑到屏幕边上：
+            # 强制提到最前面，用户才看得见二维码。
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
             await asyncio.sleep(1.2)
             # 关键：登录页默认可能停在手机号/密码，主动切到「扫码登录」
             qr_ok = await self._activate_qr_tab(page)
