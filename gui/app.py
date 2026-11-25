@@ -176,6 +176,10 @@ class App(object):
         self._closing = False
         self._tick_started = False
         self.picked = set()          # 表格里勾选的店铺 id（批量举报用）
+        self._login_queue = []       # 勾选多家时的扫码队列（逐家弹窗口，不并发）
+        self._login_poll = None      # 队列轮询的 after id
+        self._login_total = 0
+        self._menu_row = None        # 右键菜单打开时命中的行（扫码登录只针对它）
         # 启动那一刻真正跑起来的版本（下载完补丁后也不会误显示成新版）
         self._running_ver = _ver_state()
         self._checking_update = False
@@ -562,7 +566,7 @@ class App(object):
         self.tree.tag_configure("picked", background=t["accent_soft"],
                                foreground=t["accent"])
         self.tree.bind("<Button-1>", self._on_tree_click)
-        self.tree.bind("<Double-1>", lambda e: self.do_login())
+        self.tree.bind("<Double-1>", self._on_tree_double)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_detail())
         self.tree.bind("<Button-3>", self._popup_menu)
 
@@ -733,7 +737,10 @@ class App(object):
         self.root.config(menu=m)
 
         self.popup = self._menu(self.root)
-        self.popup.add_command(label="扫码登录", command=self.do_login)
+        self.popup.add_command(
+            label="扫码登录",
+            command=lambda: self.do_login(
+                [self._menu_row] if getattr(self, "_menu_row", None) else None))
         self.popup.add_command(label="刷新数量", command=self.do_refresh)
         self.popup.add_command(label="上报页面诊断", command=self.do_star_diag)
         self.popup.add_command(label="开始举报", command=self.do_start)
@@ -961,6 +968,7 @@ class App(object):
         row = self.tree.identify_row(event.y)
         if not row:
             return
+        self._menu_row = row
         self.tree.selection_set(row)
         try:
             self.popup.tk_popup(event.x_root, event.y_root)
@@ -987,10 +995,28 @@ class App(object):
         sel = self.tree.selection()
         return sel[0] if sel else None
 
-    def _call(self, cmd, sid=None, **kw):
-        sid = sid or self.selected()
+    def picked_ids(self):
+        """被勾选的店铺 id（按表格顺序）。勾选是左侧方框，和「当前行高亮」不是一回事。"""
+        try:
+            return [sid for sid in self.tree.get_children() if sid in self.picked]
+        except Exception:
+            return []
+
+    def target_shop(self):
+        """操作对象：勾了店铺就用勾选的，没勾才用当前高亮的行。
+
+        之前点方框勾选会「break」掉默认选中，导致勾完再点「扫码登录」提示
+        「请先选中一个店铺」——这里统一改成勾选优先。
+        """
+        ids = self.picked_ids()
+        if ids:
+            return ids[0]
+        return self.selected()
+
+    def _call(self, cmd, sid=None, prefer_pick=False, **kw):
+        sid = sid or (self.target_shop() if prefer_pick else self.selected())
         if not sid:
-            messagebox.showinfo("提示", "请先选中一个店铺", parent=self.root)
+            messagebox.showinfo("提示", "请先勾选（点左侧方框）或选中一家店铺", parent=self.root)
             return False
         self.engine.call(cmd, sid, **kw)
         return True
@@ -1062,13 +1088,101 @@ class App(object):
         self.store.remove(sid)
         self.picked.discard(sid)
 
-    def do_login(self):
-        if self._call("login"):
-            self.status_var.set(
-                "已打开扫码登录窗口（默认切到二维码）· 登录成功后自动获取店铺名并关闭窗口")
+    def _on_tree_double(self, event):
+        """双击某一行 = 给这一家打开扫码登录（不看勾选，双击哪家就是哪家）。"""
+        try:
+            row = self.tree.identify_row(event.y)
+        except Exception:
+            row = ""
+        if not row:
+            return None
+        self.tree.selection_set(row)
+        self.do_login([row])
+        return "break"
+
+    def do_login(self, shop_ids=None):
+        """扫码登录：优先用勾选的店铺；勾了多家就逐家弹窗口扫。
+
+        旧版只认「当前高亮行」，而勾选方框会吃掉选中事件，所以勾完再点
+        扫码登录永远提示「请先选中一个店铺」。
+        """
+        if shop_ids is None:
+            ids = self.picked_ids()
+            if not ids:
+                sid = self.selected()
+                if not sid:
+                    messagebox.showinfo(
+                        "提示", "请先勾选（点左侧方框）或选中一家店铺，再点「扫码登录」",
+                        parent=self.root)
+                    return
+                ids = [sid]
+        else:
+            ids = [i for i in shop_ids if i]
+        if not ids:
+            return
+
+        # 已经在扫码中：不要覆盖队列，只提示
+        if any("扫码中" in (self.engine.state_for(sid).get("status") or "")
+               for sid in ids):
+            self.status_var.set("已有店铺正在扫码，请先完成或点「取消扫码」")
+            return
+
+        if self._login_poll:
+            try:
+                self.root.after_cancel(self._login_poll)
+            except Exception:
+                pass
+            self._login_poll = None
+        self._login_queue = list(ids)
+        self._login_total = len(ids)
+        self._start_next_login()
+
+    def _start_next_login(self):
+        """从队列里取下一家打开扫码窗口；扫完（成功/失败/超时）自动继续。"""
+        self._login_poll = None
+        if not self._login_queue:
+            self.status_var.set("扫码登录已完成")
+            return
+        sid = self._login_queue.pop(0)
+        if sid not in self.engine.snapshot():
+            # 店铺已被删除，直接跳过
+            if self._login_queue:
+                self.root.after(300, self._start_next_login)
+            return
+        st = self.engine.state_for(sid)
+        name = st.get("name") or sid
+        if "扫码中" in (st.get("status") or ""):
+            # 这家已经在扫了，等它结束再继续下一家
+            self._poll_login_done(sid)
+            return
+        self.engine.call("login", sid)
+        left = len(self._login_queue)
+        tip = ("已打开扫码窗口：%s（剩余 %d 家排队）" % (name, left)) if left else \
+              ("已打开扫码登录窗口：%s" % name)
+        self.status_var.set(
+            tip + " · 登录成功后自动关闭窗口并转为后台在线")
+        self._poll_login_done(sid)
+
+    def _poll_login_done(self, sid):
+        """轮询当前这家是否扫完；扫完自动弹下一家（不并发，避免多个窗口抢焦点）。"""
+        def _check():
+            self._login_poll = None
+            if self._closing:
+                return
+            st = self.engine.state_for(sid)
+            status = st.get("status") or ""
+            running = ("扫码中" in status) or ("连接中" in status)
+            if running:
+                self._login_poll = self.root.after(1200, _check)
+                return
+            if self._login_queue:
+                self.status_var.set("上一家已结束（%s），2 秒后打开下一家扫码窗口…"
+                                    % (status or "完成"))
+                self._login_poll = self.root.after(2000, self._start_next_login)
+        self._login_poll = self.root.after(1200, _check)
 
     def do_refresh(self):
-        self._call("refresh")
+        self._call("refresh", prefer_pick=True)
 
     def do_star_diag(self):
         """生成桌面诊断报告：纯本地文本 + 页面截图，不依赖云回传。"""
@@ -1368,6 +1482,11 @@ class App(object):
             self.status_var.set("已开始批量举报 %d 家店铺…" % len(ids))
             return
         # 2) 没勾选 → 保持原来的单选行为
+        if self.picked:
+            self.status_var.set(
+                "勾选的 %d 家店铺都不在线（未登录或掉线），请先点「扫码登录」"
+                % len(self.picked))
+            return
         if self.selected():
             st = self.engine.state_for(self.selected())
             if st.get("daily_limit") and not messagebox.askyesno(

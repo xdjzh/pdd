@@ -883,8 +883,10 @@ class ShopSession(object):
         if browser is None:
             self.set("浏览器未就绪", "没找到可用的 Chrome / Edge / Chromium")
             return False
-        # 重建前先把续期后的 cookie 落盘，别把在线状态弄丢
-        if self.context:
+        # 重建前先把续期后的 cookie 落盘，别把在线状态弄丢；
+        # 但只在「当前上下文确实在线」时才写 —— 掉线的旧 cookie 一旦落盘，
+        # 会把用户刚扫完码拿到的登录态覆盖成已失效的旧状态。
+        if self.context and self.online:
             await self.save_login_state()
         await self.close_context()
         storage = self.store.storage_file(self.id)
@@ -1089,6 +1091,10 @@ class ShopSession(object):
 
             # 保存登录态，然后关闭可见窗口 —— 这就是「登录后隐藏」
             await ctx.storage_state(path=self.store.storage_file(self.id))
+            # 旧的后台上下文里是已失效的 cookie：必须先丢掉。
+            # 否则下面 ensure_context(force=True) 会先「把当前上下文的 cookie 落盘」，
+            # 用它把刚扫码得到的新登录态覆盖掉 —— 表现就是「扫完码还是掉线」。
+            await self.close_context()
             self.set("登录成功", "登录窗口已关闭，正在切换为后台在线")
         except Exception as e:
             self.set("登录失败", str(e)[:160])
@@ -1110,6 +1116,14 @@ class ShopSession(object):
             await self.ensure_context(force=True)
             await self._enter_review_page()
             if self.page_kind == "login":
+                # 刚扫完码时 cookie 可能还要再跳一次才落到 mms 域，给他一次重试
+                await asyncio.sleep(2.0)
+                await self.ensure_context(force=True)
+                await self._enter_review_page()
+            if self.page_kind == "login":
+                self.set("掉线，请重新扫码",
+                         "扫码已成功，但后台没带上登录态；请再扫一次"
+                         "（仍不行点「刷新数量」，诊断会自动回传）", online=False)
                 return False
             self.online = True
             await self.refresh_stars()

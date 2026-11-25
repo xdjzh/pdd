@@ -663,7 +663,11 @@ class Engine(object):
                                       kind="login")
                 # 新增店铺扫码成功后：若自动任务开着，立刻给这家补跑一次
                 # （否则「一天只跑一次」会让新店白漏一天）
-                if kw.get("new_shop") and s.store.has_login(s.id):
+                # 只有这次真的登上了（online=True 且不在登录页）才补跑，
+                # 别拿上一次残留的登录态文件当成功。
+                if (kw.get("new_shop") and s.online
+                        and s.page_kind != "login"
+                        and s.store.has_login(s.id)):
                     try:
                         await self._auto_report_shop(s, why="新增店铺")
                     except asyncio.CancelledError:
