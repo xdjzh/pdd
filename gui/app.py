@@ -184,6 +184,9 @@ class App(object):
         self._locked = False
         self._tray_tip_at = 0.0
         self._tray_polling = False
+        self._tray_reason = ""        # 托盘最后一次启动失败的原因（给用户看）
+        self._ball = None             # 托盘挂不上时的右下角悬浮球兜底
+        self._migrate_close_action()
         self._build_ui()
         self._init_tray()
         self.engine.start()
@@ -570,6 +573,9 @@ class App(object):
         kw = {"fam": self.fam, "size": self.fs["md"]}
         PillButton(bar, t, "添加店铺", self.do_add, kind="primary",
                    icon="plus", **kw).pack(side=tk.LEFT, padx=(0, 8))
+        PillButton(bar, t, "浏览器自检", self.do_browser_check,
+                   kind="secondary", icon="shield",
+                   **kw).pack(side=tk.LEFT, padx=(0, 8))
         PillButton(bar, t, "开始举报", self.do_start, kind="primary",
                    **kw).pack(side=tk.LEFT, padx=(0, 8))
         PillButton(bar, t, "全部开始", self.do_start_all, kind="secondary",
@@ -718,8 +724,6 @@ class App(object):
         helpm.add_command(label="检查更新", command=self.do_check_update)
         helpm.add_command(label="版本信息", command=self.do_version_info)
         helpm.add_separator()
-        helpm.add_command(label="浏览器自检（扫码窗口打不开时）",
-                          command=self.do_browser_check)
         helpm.add_command(label="使用说明", command=self.do_help)
         m.add_cascade(label="帮助", menu=helpm)
 
@@ -738,6 +742,21 @@ class App(object):
         self.popup.add_command(label="重命名", command=self.do_rename)
         self.popup.add_command(label="重新获取店铺名", command=self.do_shop_name)
         self.popup.add_command(label="删除店铺", command=self.do_remove)
+
+    def _migrate_close_action(self):
+        """一次性修正：早先「托盘挂不上」时，设置里的关闭动作可能被留在
+        「最小化到任务栏」，导致升级后点 X 还是收到任务栏。若这台机器从来没
+        成功隐藏到托盘（tray_tip_shown=False），就把它改回默认的托盘行为。"""
+        try:
+            if self.settings.get("tray_migrated"):
+                return
+            self.settings.set("tray_migrated", True)
+            if (str(self.settings.get("close_action") or "tray") == "taskbar"
+                    and not self.settings.get("tray_tip_shown")):
+                self.settings.set("close_action", "tray")
+                self._tray_log("关闭行为已从 taskbar 迁回 tray")
+        except Exception:
+            pass
 
     # ---------- 定时刷新 ----------
     def _visible(self):
@@ -1000,7 +1019,7 @@ class App(object):
         self.engine.add_shop(shop, then="login", new_shop=True)
         self.status_var.set(
             "正在打开扫码登录窗口（默认二维码）· 若 10 秒内没弹出来，"
-            "看错误提示或用菜单「帮助 → 浏览器自检」"
+            "看错误提示，或点「浏览器自检」查看原因"
             + ("· 自动任务已开，登录成功后将自动补跑举报"
                if self.settings.get("auto_task") else ""))
 
@@ -1145,6 +1164,34 @@ class App(object):
         """浏览器自检：扫码窗口打不开时，一键生成明确原因（并保存到桌面）。"""
         self.status_var.set("正在自检浏览器内核，请稍候…")
         self.engine.call("browser_check")
+
+    def retry_tray(self):
+        """重新加载右下角图标（托盘 / 悬浮球）。"""
+        try:
+            if self._tray:
+                self._tray.stop()
+        except Exception:
+            pass
+        if self._ball:
+            try:
+                self._ball.hide()
+            except Exception:
+                pass
+        self._tray = None
+        self._tray_reason = ""
+        self._init_tray(retry=0)
+        if self._tray and self._tray.is_running():
+            messagebox.showinfo("右下角图标", "托盘图标已重新加载成功。\n"
+                                "现在点窗口右上角 X 就会收到右下角通知区域。",
+                                parent=self.root)
+        else:
+            messagebox.showwarning(
+                "右下角图标",
+                "通知区域图标仍然加载不了。\n\n原因：%s\n\n"
+                "已自动改用「右下角悬浮球」：点 X 后右下角会出现一个小圆钮，"
+                "左键打开界面、右键看菜单。\n\n"
+                "详细日志：pdd_data\\tray.log"
+                % (self._tray_reason or "未知"), parent=self.root)
 
     def _check_update(self, manual=False):
         """后台查云端；发现新版直接下载安装，下次启动生效。"""
@@ -1460,7 +1507,7 @@ class App(object):
             "1. 点「添加店铺」会直接打开扫码登录窗口（默认切到二维码），"
             "用商家版 APP 扫码即可；店铺名会自动从商家后台获取，不用手输。\n"
             "   如果扫码窗口没弹出来：先看软件弹的错误框（会写明具体原因），"
-            "或点菜单「帮助 → 浏览器自检」生成桌面诊断文件；"
+            "或点「浏览器自检」生成桌面诊断文件；"
             "新电脑常见原因是既没装 Chrome、Edge 又是老版，装个 Chrome 后重开即可。\n"
             "2. 登录成功后浏览器窗口自动关闭，店铺转为后台在线；"
             "如果没抓到店铺名，可右键「重命名」。\n"
@@ -1477,9 +1524,11 @@ class App(object):
             "8. 1/2/3 星数量按「接口统计 → 星级标签 → 逐页统计评价卡片 → 筛选分页」"
             "四级读取；读不到时显示「—」（不是 0 条），并可右键「上报页面诊断」，"
             "程序会自动把真实页面结构回传给开发者，无需你手动传文件。\n"
-            "9. 点窗口右上角 X 会隐藏到右下角托盘（任务栏不留按钮），程序继续"
-            "后台续期登录、跑自动任务；左键点托盘图标打开主界面，右键可锁定、"
-            "设置、检测版本、退出；想改回最小化到任务栏，在「设置」里切换。\n"
+            "9. 点窗口右上角 X 会隐藏到右下角（任务栏不留按钮），程序继续后台"
+            "续期登录、跑自动任务；左键点图标打开主界面，右键可锁定、设置、"
+            "检测版本、退出。若这台电脑通知区域挂不上图标，会在右下角显示一个\n"
+            "   「PDD 工作台」悬浮圆钮（同样左键打开、右键菜单）；"
+            "想改回最小化到任务栏，在「设置」里切换。\n"
             "10. 自动任务按「每家店铺 / 每天一次」记录：当天新增的店铺，"
             "扫码登录成功后会自动补跑一次举报，不会因为「今天已经跑过」等到明天。\n\n"
             "数据目录：程序同级的 pdd_data 文件夹（可整包拷贝备份）。",
@@ -1511,15 +1560,40 @@ class App(object):
                     icon_path=os.path.join(app_base_dir(), "app.ico"),
                     log=self._tray_log)
             if not self._tray.start():
-                self._tray = None
-                if retry > 0:
-                    # 开机自启时资源管理器可能还没就绪，8 秒后再试一次
-                    self._tray_log("托盘首次启动失败，8 秒后重试")
+                self._tray_reason = str(getattr(self._tray, "last_error", "") or "")
+                self._tray_log("托盘启动失败：%s" % (self._tray_reason or "未知原因"))
+                # 线程可能还在重试（安全软件拦一下会慢几秒），先留着对象再看一眼，
+                # 免得这边判定失败、那边图标又挂上了（会出现两个图标且事件收不到）
+                keep = self._tray
+
+                def _recheck():
+                    if keep.is_running():
+                        self._tray = keep
+                        self._tray_reason = ""
+                        self._tray_log("托盘图标稍后启动成功")
+                        self._update_tray_tip()
+                        if not self._tray_polling:
+                            self._tray_polling = True
+                            self.root.after(150, self._poll_tray)
+                        return
                     try:
-                        self.root.after(8000,
-                                        lambda: self._init_tray(retry - 1))
+                        keep.stop(wait=0.5)
                     except Exception:
                         pass
+                    if self._tray is keep:
+                        self._tray = None
+                    if retry > 0:
+                        self._tray_log("托盘首次启动失败，8 秒后重试")
+                        try:
+                            self.root.after(8000,
+                                            lambda: self._init_tray(retry - 1))
+                        except Exception:
+                            pass
+
+                try:
+                    self.root.after(4000, _recheck)
+                except Exception:
+                    self._tray = None
                 return
             self._update_tray_tip()
             if not self._tray_polling:
@@ -1581,7 +1655,7 @@ class App(object):
 
     # ---------- 显示 / 隐藏 / 锁定 ----------
     def show_main(self):
-        """从托盘唤起主界面；锁定时先要密码。返回 True=已显示。"""
+        """从托盘/悬浮球唤起主界面；锁定时先要密码。返回 True=已显示。"""
         if self._locked and not self._unlock_dialog(open_window=False):
             return False
         try:
@@ -1592,6 +1666,11 @@ class App(object):
             self.root.after(400, self._drop_topmost)
         except Exception:
             pass
+        if self._ball:
+            try:
+                self._ball.hide()
+            except Exception:
+                pass
         self._update_tray_tip()
         return True
 
@@ -1601,11 +1680,53 @@ class App(object):
         except Exception:
             pass
 
+    def _ball_menu(self):
+        """悬浮球右键菜单（和托盘菜单同一套功能）。"""
+        return [("打开主界面", self.show_main),
+                "-",
+                ("解锁…" if self._locked else "锁定", self.lock_app),
+                ("设置…", self.do_settings),
+                ("检测版本", self.do_check_update),
+                "-",
+                ("退出程序", self.do_quit)]
+
+    def _ensure_ball(self):
+        """创建右下角悬浮球（托盘图标挂不上时的兜底）。"""
+        try:
+            from . import tray as tray_mod
+        except Exception as e:
+            self._tray_log("导入悬浮球模块失败：%s" % e)
+            return None
+        if self._ball is None:
+            try:
+                self._ball = tray_mod.FloatingBall(
+                    self.root, on_open=self.show_main,
+                    menu_items=self._ball_menu, log=self._tray_log)
+            except Exception as e:
+                self._tray_log("创建悬浮球失败：%s" % e)
+                self._ball = None
+        return self._ball
+
     def hide_to_tray(self, notify=True):
-        """隐藏到右下角托盘：任务栏不留按钮，后台继续续期登录、跑自动任务。"""
-        if not (self._tray and self._tray.is_running()):
-            # 托盘没起来就退回最小化到任务栏，绝不会把窗口弄丢
+        """隐藏到右下角：优先真托盘图标，不行就用右下角悬浮球，最后才退化到任务栏。"""
+        tray_ok = bool(self._tray and self._tray.is_running())
+        ball = None if tray_ok else self._ensure_ball()
+        ball_ok = bool(ball and ball.show())
+        if not tray_ok and not ball_ok:
+            # 两样都起不来才退回最小化，绝不会把窗口弄丢
             self.minimize_to_taskbar(notify=notify)
+            if notify:
+                try:
+                    messagebox.showwarning(
+                        "已最小化到任务栏",
+                        "右下角图标没能创建，已改为最小化到任务栏。\n\n"
+                        "托盘失败原因：%s\n"
+                        "（详细日志：pdd_data\\tray.log）\n\n"
+                        "点任务栏图标即可重新打开窗口。"
+                        % (self._tray_reason or "未知"),
+                        parent=self.root)
+                except Exception:
+                    pass
             return
         first = notify and not self.settings.get("tray_tip_shown")
         try:
@@ -1615,17 +1736,21 @@ class App(object):
         if first:
             try:
                 self.settings.set("tray_tip_shown", True)
-                self._tray.notify(
-                    "程序已隐藏到右下角",
-                    "图标在右下角通知区域（时钟旁边）。\n"
-                    "左键单击打开主界面，右键可锁定、设置、检测版本、退出。")
+                if tray_ok:
+                    self._tray.notify(
+                        "程序已隐藏到右下角",
+                        "图标在右下角通知区域（时钟旁边）。\n"
+                        "左键单击打开主界面，右键可锁定、设置、检测版本、退出。")
             except Exception:
                 pass
         try:
-            self.status_var.set("已隐藏到右下角托盘 · 左键点图标打开，右键看菜单")
+            self.status_var.set(
+                "已隐藏到右下角%s · 左键点它打开主界面，右键看菜单"
+                % ("" if tray_ok else "悬浮球"))
         except Exception:
             pass
-        self._update_tray_tip()
+        if tray_ok:
+            self._update_tray_tip()
 
     @staticmethod
     def _sha(text):
@@ -1633,16 +1758,21 @@ class App(object):
 
     def lock_app(self):
         """锁定：窗口立即隐藏，重新打开必须输密码。"""
-        if not (self._tray and self._tray.is_running()):
+        tray_ok = bool(self._tray and self._tray.is_running())
+        ball = None if tray_ok else self._ensure_ball()
+        if not tray_ok and not (ball and ball.show()):
             messagebox.showinfo(
-                "锁定", "托盘图标没有启动，暂时无法锁定。\n"
-                "重启软件后即可使用（托盘不可用时会自动改为最小化到任务栏）。",
+                "锁定", "右下角图标没有启动，暂时无法锁定。\n"
+                "托盘失败原因：%s\n（详细日志：pdd_data\\tray.log）"
+                % (self._tray_reason or "未知"),
                 parent=self.root)
             return
         if not self.settings.get("lock_pin_sha"):
             if not self._pin_dialog(
                     mode="set", title="先设置解锁密码",
                     subtitle="锁定后打开主界面要输这个密码（至少 4 位）"):
+                if not tray_ok and ball:
+                    ball.hide()
                 return
         self._locked = True
         try:
@@ -1651,8 +1781,9 @@ class App(object):
             pass
         self._update_tray_tip()
         try:
-            self.status_var.set("已锁定 · 点托盘图标输密码解锁")
-            self._tray.notify("已锁定", "窗口已隐藏，需要密码才能重新打开。")
+            self.status_var.set("已锁定 · 点右下角图标输密码解锁")
+            if tray_ok:
+                self._tray.notify("已锁定", "窗口已隐藏，需要密码才能重新打开。")
         except Exception:
             pass
 
@@ -1902,6 +2033,8 @@ class App(object):
 
         tool_btn("清除当日上限标记", self.do_clear_limit)
         tool_btn("刷新 1/2/3 星", self.do_refresh)
+        tool_btn("重新加载右下角图标", self.retry_tray)
+        tool_btn("浏览器自检", self.do_browser_check)
         tool_btn("使用说明", self.do_help)
 
         # 5) 底部
@@ -2044,6 +2177,11 @@ class App(object):
         if self._tray:
             try:
                 self._tray.stop()
+            except Exception:
+                pass
+        if self._ball:
+            try:
+                self._ball.hide()
             except Exception:
                 pass
         try:
